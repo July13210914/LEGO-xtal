@@ -5,8 +5,7 @@ This repository provides tools for batch optimization of crystal structure repre
 ## Overview
 
 The pipeline enables you to:
-1. Optimize crystal structure parameters with symmetry-based loss functions
-2. Generate valid crystal structures with improved symmetry
+1. Optimize crystal structure parameters using a descriptor-based loss in PyTorch, with fully batched, end-to-end differentiable computation enabling autograd backpropagation.
 3. Save results as CIF files and perform energy calculations (GULP / MACE)
 4. Build a database of optimized structures
 
