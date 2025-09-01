@@ -24,7 +24,7 @@ Required data files:
 Run the batch optimization with default settings:
 
 ```bash
-python batch_opt_full_new.py
+python batch_opt.py
 ```
 
 ### Configuration
