@@ -1,13 +1,6 @@
 # Crystal Structure Batch Optimization in GPU with PyTorch Autograd (Adam)
 
-This repository provides tools for batch optimization of crystal structure representations using PyTorch and symmetry-aware loss functions.
-
-## Overview
-
-The pipeline enables you to:
-1. Optimize crystal structure parameters using a descriptor-based loss in PyTorch, with fully batched, end-to-end differentiable computation enabling autograd backpropagation.
-3. Save results as CIF files and perform energy calculations (GULP / MACE)
-4. Build a database of optimized structures
+The pipeline enables you to optimize crystal structure parameters using a descriptor-based loss in PyTorch, with fully batched, end-to-end differentiable computation enabling autograd backpropagation.
 
 ## Requirements
 
