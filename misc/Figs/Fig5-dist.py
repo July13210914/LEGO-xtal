@@ -4,6 +4,7 @@ import numpy as np
 import seaborn as sns
 import matplotlib.gridspec as gridspec
 
+colors = ["#004c4c", "#008080", "#66b2b2", "#b2d8d8"]
 sns.set(style="whitegrid")
 sns.set_context("paper", font_scale=1.5)
 db0 = db.connect("../../data/source/lego-sp2.db")
@@ -48,7 +49,7 @@ for i, mask in enumerate(bin_indices):
     heights.append(hist)
 for i, hist in enumerate(heights):
     ax1.bar(bins[:-1], hist, width=np.diff(bins), bottom=bottom,
-                 alpha=0.7, label=natom_labels[i])
+                 alpha=0.7, label=natom_labels[i], color=colors[i])
     bottom += hist
 print(bins[0], bottom[0], bins[-1], bottom[-1], sum(bottom))
 
@@ -77,7 +78,7 @@ for i, mask in enumerate(bin_indices):
 
 for i, hist in enumerate(heights):
     ax2.bar(bins[:-1], hist, width=np.diff(bins), bottom=bottom,
-                  alpha=0.7, label=spg_labels[i])
+                  alpha=0.7, label=spg_labels[i], color=colors[i])
     bottom += hist
 print(bins[0], bottom[0], bins[-1], bottom[-1], sum(bottom))
 
@@ -106,7 +107,7 @@ for i, mask in enumerate(bin_indices):
 
 for i, hist in enumerate(heights):
     ax3.bar(bins[:-1], hist, width=np.diff(bins), bottom=bottom,
-                  alpha=0.7, label=dim_labels[i])
+                  alpha=0.7, label=dim_labels[i], color=colors[i])
     bottom += hist
 print(bins[0], bottom[0], bins[-1], bottom[-1], sum(bottom))
 ax3.set_ylabel('Count')
@@ -135,7 +136,7 @@ for i, mask in enumerate(bin_indices):
 
 for i, hist in enumerate(heights):
     ax4.bar(bins[:-1], hist, width=np.diff(bins), bottom=bottom,
-                  alpha=0.7, label=dof_labels[i])
+                  alpha=0.7, label=dof_labels[i], color=colors[i])
     bottom += hist
 print(bins[0], bottom[0], bins[-1], bottom[-1], sum(bottom))
 #ax4.set_xlabel('MACE Energy (eV)')
@@ -157,4 +158,4 @@ ax.set_title('(e) MACE vs FF Energy')
 
 plt.tight_layout()
 plt.grid(False)
-plt.savefig("lego-sp2.pdf")
+plt.savefig("Fig5.pdf")
