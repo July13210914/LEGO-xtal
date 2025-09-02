@@ -1,4 +1,4 @@
-# Crystal Structure Batch Optimization in GPU with PyTorch Autograd (Adam)
+# Crystal Structure Batch Optimization in GPU with PyTorch
 
 The pipeline enables you to optimize crystal structure parameters using a descriptor-based loss in PyTorch, with fully batched, end-to-end differentiable computation enabling autograd backpropagation.
 
