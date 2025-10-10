@@ -39,6 +39,7 @@ By utilizing different local environments as training sources, LEGO-Xtal can rap
    ```bash
    pip install mace-torch
    python -m pip install -U juliacall juliapkg
+   pip install torch-dftd
    ```
 
 ### Julia Configuration

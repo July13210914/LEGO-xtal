@@ -7,7 +7,13 @@
 #SBATCH --mem-per-cpu=2G
 #SBATCH --output=/dev/null
 MODEL=$SLURM_JOB_NAME
+source "$HOME/miniconda3/etc/profile.d/conda.sh"
 conda activate legoxtal
+
+# --- Make juliacall/julia see the SAME paths in batch
+export JULIACALL_EXE="$(which julia)"                 
+export JULIA_DEPOT_PATH="$CONDA_PREFIX/julia_depot"  
+export JULIA_PROJECT="$CONDA_PREFIX/julia_env"        
 
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1

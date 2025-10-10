@@ -130,8 +130,8 @@ if __name__ == "__main__":
     #energy calculation time
     t_energy = int((time()-t_energy_start)/60)
     print(f"Rank-{rank} energy calculation time: {t_energy} min")
-    N3 = bu.db.get_db_unique(f'{name}/unique_{rank}.db')
-    
+    N3 = bu.db.get_db_unique(f'{name}/unique_{rank}.db',update_topology=False, key='ff_energy')
+
     print(f'R-{rank} N0/N1/N2/N3: {N0}/{N1}/{N2}/{N3} in {t} min/{ncpu} cores')
     local_data = (N0, N1, N2, N3)
 
