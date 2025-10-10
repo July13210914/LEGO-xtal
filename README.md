@@ -23,3 +23,56 @@ The LEGO-Xtal workflow is illustrated below using sp²-hybridized carbon structu
     *   Compile the generated and validated structures into a database for further analysis.
 
 By utilizing different local environments as training sources, LEGO-Xtal can rapidly generate high-quality crystal candidates for designing complex materials, including metal-organic frameworks (MOFs) and battery materials. Combining materials science domain knowledge with advanced AI methodologies, LEGO-Xtal aims to advance AI-driven crystal structure generation, paving the way for more efficient materials discovery and design.
+
+
+
+
+
+### Environment Setup
+
+1. **Create the conda environment:**
+   ```bash
+   conda create -n legoxtal python=3.10.12 julia=1.10.4
+   conda activate legoxtal
+   ```
+
+2. **Install the environment from the provided configuration:**
+   ```bash
+   conda env create -f environment.yml
+   ```
+
+3. **Install MACE and Julia integration packages:**
+   ```bash
+   pip install mace-torch
+   python -m pip install -U juliacall juliapkg
+   ```
+
+### Julia Configuration
+
+Set the required environment variables for Julia integration:
+
+```bash
+export JULIAPKG_JULIA_VERSION=1.10.3
+export JULIA_DEPOT_PATH="$CONDA_PREFIX/julia_depot"
+export JULIA_PROJECT=""
+```
+
+### Verification
+
+Verify the installation by testing the Julia-Python integration:
+
+```python
+from juliacall import Main as jl
+
+# Sanity check: Julia & PythonCall are live
+print(jl.seval('VERSION'))
+print(jl.seval('using PythonCall; "PythonCall loaded"'))
+
+# Install & use CrystalNets for topology analysis
+jl.seval('import Pkg; Pkg.add("CrystalNets"); using CrystalNets')
+print("Installation successful")
+```
+
+
+
+
