@@ -31,17 +31,11 @@ By utilizing different local environments as training sources, LEGO-Xtal can rap
 ### Environment Setup
 
 1. **Create the conda environment:**
-   ```bash
-   conda create -n legoxtal python=3.10.12 julia=1.10.4
+   conda env create -f environment.yml
    conda activate legoxtal
    ```
 
-2. **Install the environment from the provided configuration:**
-   ```bash
-   conda env create -f environment.yml
-   ```
-
-3. **Install MACE and Julia integration packages:**
+2. **Install MACE and Julia integration packages:**
    ```bash
    pip install mace-torch
    python -m pip install -U juliacall juliapkg
