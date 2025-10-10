@@ -1,5 +1,5 @@
 #!/bin/sh -l
-#SBATCH --partition=Orion
+#SBATCH --partition=Apus
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=96
@@ -7,6 +7,17 @@
 #SBATCH --mem-per-cpu=2G
 #SBATCH --output=/dev/null
 MODEL=$SLURM_JOB_NAME
+conda activate legoxtal
+
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
+export BLIS_NUM_THREADS=1
+export VECLIB_MAXIMUM_THREADS=1
+export TBB_NUM_THREADS=1
+export MKL_DYNAMIC=FALSE
+export OPENBLAS_MAIN_FREE=1
 
 # Set RUN_RELAX to 'yes' by default
 # Check if a '--no-relax' argument was provided to disable relax.py
@@ -46,7 +57,7 @@ python 3_energy.py --ncpu ${NCPU}  --step 250 --min 1   --max 100  --db ${MODEL}
 python 3_energy.py --ncpu ${NCPU1} --step 100 --min 100 --max 200  --db ${MODEL}/final.db
 python 3_energy.py --ncpu ${NCPU1} --step 100 --min 100 --max 200  --db ${MODEL}/final.db
 python 3_energy.py --ncpu ${NCPU2} --step 50  --min 200 --max 1000 --db ${MODEL}/final.db
-python 3_energy.py --ncpu ${NCPU2} --step 50  --min 200 --max 1000 --db ${MODEL}/final.db
+python 3_energy.py --ncpu ${NCPU2} --step 50  --min 200 --max 1000 --db ${MODEL}/final.db --metric
 END_TIME=$(date +%s)
 ELAPSED_TIME=$((END_TIME - START_TIME))
 echo "MACE Energy minimization script completed in $((ELAPSED_TIME / 60)) minutes."

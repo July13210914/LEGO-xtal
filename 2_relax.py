@@ -8,7 +8,13 @@ from functools import partial
 from pyxtal import pyxtal
 from pyxtal.lego.builder import builder
 from pyxtal.db import database_topology
+from juliacall import Main as jl
 
+# Sanity check: Julia & PythonCall are live
+print(jl.seval('VERSION'))
+print(jl.seval('using PythonCall; "PythonCall loaded"'))
+jl.seval('import Pkg; Pkg.add("CrystalNets"); using CrystalNets')
+print("Success")
 def process_rep(rep, discrete, discrete_cell, discrete_res):
     xtal = pyxtal()
     # Remove the extra energy and labels
@@ -118,9 +124,14 @@ if __name__ == "__main__":
                                          ('L-BFGS-B', 200)],
                              N_grids=discrete_res)
     N2 = len(xtals)
-    bu.db.update_row_energy('GULP', ncpu=ncpu, calc_folder=f"{name}/gulp_{rank}")
-    N3 = bu.db.get_db_unique(f'{name}/unique_{rank}.db')
     t = int((time()-t0)/60)
+    t_energy_start = time()
+    bu.db.update_row_energy('GULP', ncpu=ncpu, calc_folder=f"{name}/gulp_{rank}")
+    #energy calculation time
+    t_energy = int((time()-t_energy_start)/60)
+    print(f"Rank-{rank} energy calculation time: {t_energy} min")
+    N3 = bu.db.get_db_unique(f'{name}/unique_{rank}.db')
+    
     print(f'R-{rank} N0/N1/N2/N3: {N0}/{N1}/{N2}/{N3} in {t} min/{ncpu} cores')
     local_data = (N0, N1, N2, N3)
 
@@ -133,7 +144,8 @@ if __name__ == "__main__":
     N4 = len(overlaps)
     with open(f'{name}/metric.txt', 'w') as f:
         f.write(f'Source data:     {args.csv}\n')
-        f.write(f'Elapsed minutes: {t:12d}\n')
+        f.write(f'Optimization time minutes: {t:12d}\n')
+        f.write(f'Energy calculation time minutes: {t_energy:12d}\n')
         f.write(f'N_parallel_cpus: {ncpu:12d}\n')
         f.write(f'N_total_count:   {N0:12d}\n')
         f.write(f'N_valid_xtal:    {N1:12d}\n')
