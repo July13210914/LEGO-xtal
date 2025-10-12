@@ -118,12 +118,21 @@ if __name__ == "__main__":
     bu.set_descriptor_calculator(mykwargs={'rcut': 2.1})
     bu.set_reference_enviroments(cif_file)
     bu.set_criteria(CN={'C': [args.CN]})
+    time_init = time()
     xtals = bu.optimize_reps(reps, ncpu=ncpu,
                              minimizers=[('Nelder-Mead', 100),
                                          ('L-BFGS-B', 400),
                                          ('L-BFGS-B', 200)],
                              N_grids=discrete_res)
+    t_opt = int((time()-time_init)/60)
+    print(f"Rank-{rank} optimization time: {t_opt} min")
     N2 = len(xtals)
+    print(f"Rank-{rank} gets {N2} valid optimized structures")
+    t_top_start = time()
+    bu.db.update_row_topology(overwrite=False, prefix='mof-0')
+    top_time = int((time()-t_top_start)/60)
+    print(f"Rank-{rank} topology time: {top_time} min")
+    bu.db.clean_structures_spg_topology(dim=3)
     t = int((time()-t0)/60)
     t_energy_start = time()
     bu.db.update_row_energy('GULP', ncpu=ncpu, calc_folder=f"{name}/gulp_{rank}")
@@ -144,7 +153,9 @@ if __name__ == "__main__":
     N4 = len(overlaps)
     with open(f'{name}/metric.txt', 'w') as f:
         f.write(f'Source data:     {args.csv}\n')
-        f.write(f'Optimization time minutes: {t:12d}\n')
+        f.write(f'Optimization time minutes: {t_opt:12d}\n')
+        f.write(f'Topology time minutes:     {top_time:12d}\n')
+        f.write(f'Total time minutes:        {t:12d}\n')
         f.write(f'Energy calculation time minutes: {t_energy:12d}\n')
         f.write(f'N_parallel_cpus: {ncpu:12d}\n')
         f.write(f'N_total_count:   {N0:12d}\n')

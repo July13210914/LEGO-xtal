@@ -8,12 +8,33 @@
 #SBATCH --output=/dev/null
 MODEL=$SLURM_JOB_NAME
 source "$HOME/miniconda3/etc/profile.d/conda.sh"
-conda activate legoxtal
+conda activate legoxtal3
 
-# --- Make juliacall/julia see the SAME paths in batch
-export JULIACALL_EXE="$(which julia)"                 
-export JULIA_DEPOT_PATH="$CONDA_PREFIX/julia_depot"  
-export JULIA_PROJECT="$CONDA_PREFIX/julia_env"        
+# Print active conda environment name
+if [ -n "$CONDA_DEFAULT_ENV" ]; then
+  echo "Conda env: $CONDA_DEFAULT_ENV"
+elif [ -n "$CONDA_PREFIX" ]; then
+  echo "Conda env: $(basename "$CONDA_PREFIX")"
+else
+  env_name=$(conda info --json 2>/dev/null | python -c "import sys,json; j=json.load(sys.stdin) if not sys.stdin.isatty() else {}; print(j.get('active_prefix_name',''))")
+  if [ -n "$env_name" ]; then
+    echo "Conda env: $env_name"
+  else
+    echo "Conda env: (none)"
+  fi
+fi
+
+# Test Julia integration before proceeding
+echo "Testing Julia integration..."
+python -c "
+try:
+    from juliacall import Main as jl
+    jl.seval('using PythonCall')
+    print('✅ Julia integration working')
+except Exception as e:
+    print('❌ Julia integration failed:', e)
+    exit(1)
+" 
 
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
@@ -42,12 +63,36 @@ if [ ! -d "${MODEL}" ]; then
 fi
 exec > ${MODEL}/log-${MODEL}.txt 2>&1
 
-export OMP_NUM_THREADS=1
 echo "Running on node: $(hostname)"
+# Print active conda environment name
+if [ -n "$CONDA_DEFAULT_ENV" ]; then
+  echo "Conda env: $CONDA_DEFAULT_ENV"
+elif [ -n "$CONDA_PREFIX" ]; then
+  echo "Conda env: $(basename "$CONDA_PREFIX")"
+else
+  env_name=$(conda info --json 2>/dev/null | python -c "import sys,json; j=json.load(sys.stdin) if not sys.stdin.isatty() else {}; print(j.get('active_prefix_name',''))")
+  if [ -n "$env_name" ]; then
+    echo "Conda env: $env_name"
+  else
+    echo "Conda env: (none)"
+  fi
+fi
+
+# Test Julia integration before proceeding
+echo "Testing Julia integration..."
+python -c "
+try:
+    from juliacall import Main as jl
+    jl.seval('using PythonCall')
+    print('✅ Julia integration working')
+except Exception as e:
+    print('❌ Julia integration failed:', e)
+    exit(1)
+" 
+
 NCPU=$SLURM_CPUS_PER_TASK
 NCPU1=$((NCPU/2))
 NCPU2=$((NCPU/4))
-
 
 # Conditionally run relax.py if RUN_RELAX is set to "yes"
 if [ "$RUN_RELAX" = "yes" ]; then
