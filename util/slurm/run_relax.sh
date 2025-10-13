@@ -10,32 +10,6 @@ MODEL=$SLURM_JOB_NAME
 source "$HOME/miniconda3/etc/profile.d/conda.sh"
 conda activate legoxtal3
 
-# Print active conda environment name
-if [ -n "$CONDA_DEFAULT_ENV" ]; then
-  echo "Conda env: $CONDA_DEFAULT_ENV"
-elif [ -n "$CONDA_PREFIX" ]; then
-  echo "Conda env: $(basename "$CONDA_PREFIX")"
-else
-  env_name=$(conda info --json 2>/dev/null | python -c "import sys,json; j=json.load(sys.stdin) if not sys.stdin.isatty() else {}; print(j.get('active_prefix_name',''))")
-  if [ -n "$env_name" ]; then
-    echo "Conda env: $env_name"
-  else
-    echo "Conda env: (none)"
-  fi
-fi
-
-# Test Julia integration before proceeding
-echo "Testing Julia integration..."
-python -c "
-try:
-    from juliacall import Main as jl
-    jl.seval('using PythonCall')
-    print('✅ Julia integration working')
-except Exception as e:
-    print('❌ Julia integration failed:', e)
-    exit(1)
-" 
-
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
@@ -105,10 +79,10 @@ fi
 # Stepwise relaxation by MACE 
 START_TIME=$(date +%s)
 python 3_energy.py --ncpu ${NCPU}  --step 250 --min 1   --max 100  --db ${MODEL}/final.db
-python 3_energy.py --ncpu ${NCPU1} --step 100 --min 100 --max 200  --db ${MODEL}/final.db
-python 3_energy.py --ncpu ${NCPU1} --step 100 --min 100 --max 200  --db ${MODEL}/final.db
-python 3_energy.py --ncpu ${NCPU2} --step 50  --min 200 --max 1000 --db ${MODEL}/final.db
-python 3_energy.py --ncpu ${NCPU2} --step 50  --min 200 --max 1000 --db ${MODEL}/final.db --metric
+python 3_energy.py --ncpu ${NCPU} --step 100 --min 100 --max 200  --db ${MODEL}/final.db
+python 3_energy.py --ncpu ${NCPU} --step 100 --min 100 --max 200  --db ${MODEL}/final.db
+python 3_energy.py --ncpu ${NCPU} --step 50  --min 200 --max 1000 --db ${MODEL}/final.db
+python 3_energy.py --ncpu ${NCPU} --step 50  --min 200 --max 1000 --db ${MODEL}/final.db --metric
 END_TIME=$(date +%s)
 ELAPSED_TIME=$((END_TIME - START_TIME))
 echo "MACE Energy minimization script completed in $((ELAPSED_TIME / 60)) minutes."

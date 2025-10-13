@@ -30,43 +30,18 @@ By utilizing different local environments as training sources, LEGO-Xtal can rap
 
 ### Environment Setup
 
-1. **Create the conda environment:**
+**Create the conda environment:**
    ```bash
    conda env create -f environment.yml
    conda activate legoxtal
    ```
 
-3. **Install MACE and Julia integration packages:**
-   ```bash
-   pip install mace-torch
-   python -m pip install -U juliacall juliapkg
-   pip install torch-dftd
-   ```
-
-### Julia Configuration
-
-Set the required environment variables for Julia integration:
-
-```bash
-export JULIAPKG_JULIA_VERSION=1.10.3
-export JULIA_DEPOT_PATH="$CONDA_PREFIX/julia_depot"
-export JULIA_PROJECT=""
-```
-
-### Verification
+### Julia Verification
 
 Verify the installation by testing the Julia-Python integration:
 
-```python
-from juliacall import Main as jl
-
-# Sanity check: Julia & PythonCall are live
-print(jl.seval('VERSION'))
-print(jl.seval('using PythonCall; "PythonCall loaded"'))
-
-# Install & use CrystalNets for topology analysis
-jl.seval('import Pkg; Pkg.add("CrystalNets"); using CrystalNets')
-print("Installation successful")
+```bash
+python -c "from juliacall import Main as jl; print('Julia working!')"
 ```
 
 
