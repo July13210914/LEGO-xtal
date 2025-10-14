@@ -8,7 +8,7 @@
 #SBATCH --output=/dev/null
 MODEL=$SLURM_JOB_NAME
 source "$HOME/miniconda3/etc/profile.d/conda.sh"
-conda activate legoxtal3
+conda activate legoxtal
 
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1

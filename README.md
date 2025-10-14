@@ -44,6 +44,16 @@ Verify the installation by testing the Julia-Python integration:
 python -c "from juliacall import Main as jl; print('Julia working!')"
 ```
 
+### Running Pre-relax
+
+Datasets will be stored in the data/sample folder (for example: data/sample/VAE-dis9-100000.csv).
+
+Submit the SLURM job with:
+
+```bash
+sbatch -J VAE-dis9-100000 util/slurm/run_relax.sh
+```
+
 
 
 
