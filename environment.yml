@@ -1,4 +1,4 @@
-name: legoxtal3
+name: legoxtal
 channels:
   - conda-forge
   - defaults
