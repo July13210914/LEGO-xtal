@@ -797,8 +797,8 @@ class builder(object):
                     xtals_opt.extend(valid_xtals)  # Use deque to reduce memory
 
             # Remove the duplicate structures
-            self.db.update_row_topology(overwrite=False, prefix=self.prefix)
-            self.db.clean_structures_spg_topology(dim=self.dim)
+            #self.db.update_row_topology(overwrite=False, prefix=self.prefix)
+            #self.db.clean_structures_spg_topology(dim=self.dim)
 
             # After each minibatch, delete the local variables and run garbage collection
             del ids, _xtals, _xs
