@@ -77,7 +77,7 @@ julia -e 'import Pkg; Pkg.add(name="CrystalNets", version="0.4.9"); Pkg.add("JSO
 To verify that `CrystalNets` is working correctly, first check the Julia script:
 
 ```bash
-cd Julia_Installation/
+cd util/Julia_Installation/
 julia process_topology.jl C.cif
 ```
 *Expected output:* `[{"name":"dia","dim":3,"count":1}]`
