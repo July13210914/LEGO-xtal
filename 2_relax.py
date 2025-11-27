@@ -6,15 +6,15 @@ from time import time
 from multiprocessing import Pool
 from functools import partial
 from pyxtal import pyxtal
-from pyxtal.lego.builder import builder
+from lego.builder import builder
 from pyxtal.db import database_topology
-from juliacall import Main as jl
+#from juliacall import Main as jl
 
 # Sanity check: Julia & PythonCall are live
-print(jl.seval('VERSION'))
-print(jl.seval('using PythonCall; "PythonCall loaded"'))
-jl.seval('import Pkg; Pkg.add("CrystalNets"); using CrystalNets')
-print("Success")
+#print(jl.seval('VERSION'))
+#print(jl.seval('using PythonCall; "PythonCall loaded"'))
+#jl.seval('import Pkg; Pkg.add("CrystalNets"); using CrystalNets')
+#print("Success")
 def process_rep(rep, discrete, discrete_cell, discrete_res):
     xtal = pyxtal()
     # Remove the extra energy and labels
@@ -57,6 +57,11 @@ if __name__ == "__main__":
     f = args.csv
     ncpu = args.ncpu
     begin, end = args.begin, args.end
+    
+    # Debug CPU allocation
+    print(f"Command line --ncpu: {args.ncpu}")
+    print(f"SLURM_CPUS_PER_TASK: {os.environ.get('SLURM_CPUS_PER_TASK', 'Not set')}")
+    print(f"Using ncpu = {ncpu}")
 
     xtal = pyxtal()
     xtal.from_prototype(args.prototype)
@@ -67,6 +72,9 @@ if __name__ == "__main__":
 
     # 1. Load and get valid structures sorted by number of atoms
     df = pd.read_csv(f)
+    print(f"Total rows in CSV: {len(df)}")
+    print(f"Begin: {begin}, End: {end}")
+    
     val = df['x0'].max()
     if val < 5 + 1e-3:
         discrete, discrete_res = False, None
@@ -85,6 +93,8 @@ if __name__ == "__main__":
         full_data = full_data[begin:]
     else:
         full_data = full_data[begin:end]
+    
+    print(f"Data chunk shape after slicing: {full_data.shape}")
 
     # Split the data equally among the ranks
     chunk_size = len(full_data) // size
@@ -93,6 +103,7 @@ if __name__ == "__main__":
     data = chunks[0]
     N0 = len(data)
     print(f"Rank-{rank} receives {N0} structures from {f}")
+    print(f"Processing with discrete={discrete}, discrete_res={discrete_res}, discrete_cell={discrete_cell}")
 
     # Use multiprocessing to speed up the processing of each rep
     partial_process_rep = partial(process_rep,
@@ -118,30 +129,32 @@ if __name__ == "__main__":
     bu.set_descriptor_calculator(mykwargs={'rcut': 2.1})
     bu.set_reference_enviroments(cif_file)
     bu.set_criteria(CN={'C': [args.CN]})
+    
+    print(f"About to optimize {len(reps)} structures with ncpu={ncpu}")
     time_init = time()
     xtals = bu.optimize_reps(reps, ncpu=ncpu,
                              minimizers=[('Nelder-Mead', 100),
                                          ('L-BFGS-B', 400),
                                          ('L-BFGS-B', 200)],
                              N_grids=discrete_res)
-    t_opt = int((time()-time_init)/60)
-    print(f"Rank-{rank} optimization time: {t_opt} min")
+    t_opt = round((time()-time_init), 2)
+    print(f"Rank-{rank} optimization time: {t_opt} seconds")
     N2 = len(xtals)
     print(f"Rank-{rank} gets {N2} valid optimized structures")
     t_top_start = time()
-    bu.db.update_row_topology(overwrite=False, prefix='mof-0')
-    top_time = int((time()-t_top_start)/60)
-    print(f"Rank-{rank} topology time: {top_time} min")
+    bu.db.update_row_topology(overwrite=False, prefix=f'{name}/mof-0')
+    top_time = round((time()-t_top_start), 2)
+    print(f"Rank-{rank} topology time: {top_time} seconds")
     bu.db.clean_structures_spg_topology(dim=3)
-    t = int((time()-t0)/60)
+    t = round((time()-t0), 2)
     t_energy_start = time()
     bu.db.update_row_energy('GULP', ncpu=ncpu, calc_folder=f"{name}/gulp_{rank}")
     #energy calculation time
-    t_energy = int((time()-t_energy_start)/60)
-    print(f"Rank-{rank} energy calculation time: {t_energy} min")
+    t_energy = round((time()-t_energy_start), 2)
+    print(f"Rank-{rank} energy calculation time: {t_energy} seconds")
     N3 = bu.db.get_db_unique(f'{name}/unique_{rank}.db',update_topology=False, key='ff_energy')
 
-    print(f'R-{rank} N0/N1/N2/N3: {N0}/{N1}/{N2}/{N3} in {t} min/{ncpu} cores')
+    print(f'R-{rank} N0/N1/N2/N3: {N0}/{N1}/{N2}/{N3} in {t} sec/{ncpu} cores')
     local_data = (N0, N1, N2, N3)
 
     # 3. Merge all db files
@@ -151,12 +164,19 @@ if __name__ == "__main__":
     db = database_topology(args.source, log_file=f'{name}/sp2.log')
     overlaps = db.check_overlap(f'{name}/final.db')
     N4 = len(overlaps)
+    
+    # Convert times to minutes for final report
+    t_opt_min = round(t_opt/60, 2)
+    top_time_min = round(top_time/60, 2)
+    t_min = round(t/60, 2)
+    t_energy_min = round(t_energy/60, 2)
+    
     with open(f'{name}/metric.txt', 'w') as f:
         f.write(f'Source data:     {args.csv}\n')
-        f.write(f'Optimization time minutes: {t_opt:12d}\n')
-        f.write(f'Topology time minutes:     {top_time:12d}\n')
-        f.write(f'Total time minutes:        {t:12d}\n')
-        f.write(f'Energy calculation time minutes: {t_energy:12d}\n')
+        f.write(f'Optimization time minutes: {t_opt_min:12.2f}\n')
+        f.write(f'Topology time minutes:     {top_time_min:12.2f}\n')
+        f.write(f'Total time minutes:        {t_min:12.2f}\n')
+        f.write(f'Energy calculation time minutes: {t_energy_min:12.2f}\n')
         f.write(f'N_parallel_cpus: {ncpu:12d}\n')
         f.write(f'N_total_count:   {N0:12d}\n')
         f.write(f'N_valid_xtal:    {N1:12d}\n')

@@ -15,7 +15,7 @@ echo "Running on node: $(hostname)"
 DATAFILE="data/train/${SLURM_JOB_NAME}.csv"
 echo $DATAFILE
 
-for model in  VAE #GAN 
+for model in  VAE GAN 
 do
   # Check if the CSV file exists, if not create it
     START=$(date +%s)
