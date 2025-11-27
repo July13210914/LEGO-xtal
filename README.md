@@ -30,10 +30,13 @@ By utilizing different local environments as training sources, LEGO-Xtal can rap
 
 ## Installation
 
-### 1. Install Julia
+### 1. Install Julia in base
 Ensure you have a clean installation of Julia. If you have a broken installation, remove `~/.juliaup` and `~/.julia` first.
-
-To install Juliaup:
+```bash
+rm -rf ~/.juliaup
+rm -rf ~/.julia   
+```
+To install Juliaup (Still in base):
 ```bash
 curl -fsSL https://install.julialang.org | sh
 # Follow the prompts: install for current user -> yes, default location -> yes
