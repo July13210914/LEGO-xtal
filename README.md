@@ -151,9 +151,3 @@ https://doi.org/10.1038/s41524-025-01931-9
   url = {https://doi.org/10.1038/s41524-025-01931-9}
 }
 ```
-
-**Publication Details:**
-- Received: 08 July 2025
-- Accepted: 11 December 2025
-- Published: 06 January 2026
-- Version of record: 29 January 2026
