@@ -125,3 +125,35 @@ python 2_relax.py --ncpu 32 --csv data/sample/test.csv --end 100000
 # This script runs relaxation and energy ranking
 sbatch -J test util/slurm/run_relax.sh
 ```
+
+---
+
+## Citation
+
+If you use LEGO-Xtal in your research, please cite the following article:
+
+```
+Ridwan, O.G., Pitié, S., Raj, M.S. et al. AI-assisted rapid crystal structure generation 
+towards a target local environment. npj Comput Mater 12, 64 (2026). 
+https://doi.org/10.1038/s41524-025-01931-9
+```
+
+**BibTeX:**
+```bibtex
+@article{Ridwan2026,
+  author={Ridwan, Osman Goni and Piti{\'e}, Sylvain and Raj, Monish Soundar and Dai, Dong and Frapper, Gilles and Xue, Hongfei and Zhu, Qiang},
+  title = {AI-assisted rapid crystal structure generation towards a target local environment},
+  journal = {npj Computational Materials},
+  year = {2026},
+  volume = {12},
+  pages = {64},
+  doi = {10.1038/s41524-025-01931-9},
+  url = {https://doi.org/10.1038/s41524-025-01931-9}
+}
+```
+
+**Publication Details:**
+- Received: 08 July 2025
+- Accepted: 11 December 2025
+- Published: 06 January 2026
+- Version of record: 29 January 2026
