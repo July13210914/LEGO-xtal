@@ -142,7 +142,11 @@ if __name__ == "__main__":
     N2 = len(xtals)
     print(f"Rank-{rank} gets {N2} valid optimized structures")
     t_top_start = time()
-    bu.db.update_row_topology(overwrite=False, prefix=f'{name}/mof-0')
+    bu.db.update_row_topology(
+        overwrite=False, 
+        prefix=f'{name}/mof-0',
+        timeout=600
+    )
     top_time = round((time()-t_top_start), 2)
     print(f"Rank-{rank} topology time: {top_time} seconds")
     bu.db.clean_structures_spg_topology(dim=3)
@@ -152,7 +156,7 @@ if __name__ == "__main__":
     #energy calculation time
     t_energy = round((time()-t_energy_start), 2)
     print(f"Rank-{rank} energy calculation time: {t_energy} seconds")
-    N3 = bu.db.get_db_unique(f'{name}/unique_{rank}.db',update_topology=False, key='ff_energy')
+    N3 = bu.db.get_db_unique_topology(f'{name}/unique_{rank}.db',update_topology=False, key='ff_energy')
 
     print(f'R-{rank} N0/N1/N2/N3: {N0}/{N1}/{N2}/{N3} in {t} sec/{ncpu} cores')
     local_data = (N0, N1, N2, N3)
