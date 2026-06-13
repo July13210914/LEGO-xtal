@@ -3,23 +3,58 @@ import os
 import random
 import numpy as np
 import pandas as pd
+from multiprocessing import Pool
+from functools import partial
 from pyxtal import pyxtal
 from pyxtal.db import database_topology
 from pyxtal.lego.builder import builder
 from pyxtal.util import new_struc_wo_energy
 
+def process_one_xtal(item, params):
+    """
+    Process one source structure in a multiprocessing worker.
 
-def make_builder():
+    Parameters
+    ----------
+    item : tuple
+        (source_index, xtal)
+    params : tuple
+        Parameters passed to get_reps_from_xtal.
+
+    Returns
+    -------
+    tuple
+        (source_index, list_of_representations, error_message)
+    """
+    source_index, xtal = item
+
+    # Give each worker/task a distinct reproducible random stream.
+    seed = 42 + source_index
+    random.seed(seed)
+    np.random.seed(seed)
+
+    try:
+        reps = get_reps_from_xtal(xtal, params)
+        return source_index, reps, None
+    except Exception as exc:
+        return (
+            source_index,
+            [],
+            f"{type(exc).__name__}: {exc}",
+        )
+
+
+def make_builder(prototype="graphite", CN=3, rcut=2.0):
     """Creates and configures a pyxtal builder instance."""
     xtal = pyxtal()
-    xtal.from_prototype("graphite")
+    xtal.from_prototype(prototype)
     cif_file = xtal.to_pymatgen()
-    bu = builder(["C"], [1], verbose=False)
-    bu.set_descriptor_calculator(mykwargs={"rcut": 2.0})
-    bu.set_reference_enviroments(cif_file)
-    bu.set_criteria(CN={"C": [3]})
-    return bu
 
+    bu = builder(["C"], [1], verbose=False)
+    bu.set_descriptor_calculator(mykwargs={"rcut": rcut})
+    bu.set_reference_enviroments(cif_file)
+    bu.set_criteria(CN={"C": [CN]})
+    return bu
 
 def make_csv(total_reps, energy, label, discrete, discrete_cell, N_wp, tag):
     """Converts data into csv format for model training."""
@@ -93,8 +128,11 @@ def get_reps_from_xtal(xtal, params):
         discrete_cell,
         discrete_res,
         eps,
+        prototype,
+        CN,
+        rcut,
     ) = params
-    bu = make_builder()
+    bu = make_builder(prototype=prototype, CN=CN, rcut=rcut)
 
     xtal_reps = []
 
@@ -108,7 +146,7 @@ def get_reps_from_xtal(xtal, params):
     ):
         return xtal_reps # Return empty list if initial xtal is invalid
 
-    current_energy = xtal.energy if energy else None
+    current_energy = getattr(xtal, "ff_energy", None) if energy else None
 
     # Optimize initial crystal
     xtal_opt, _, _ = bu.optimize_xtal(xtal, add_db=False)
@@ -184,7 +222,24 @@ def get_reps_from_xtal(xtal, params):
                 continue # Skip invalid or duplicate structures
 
             # --- Optimize and process the valid subgroup ---
-            xtal_sub_opt, _, _ = bu.optimize_xtal(xtal_sub, add_db=False)
+            try:
+                xtal_sub_opt, _, _ = bu.optimize_xtal(xtal_sub, add_db=False)
+            
+            except RuntimeError as exc:
+                spg = getattr(getattr(xtal_sub, "group", None), "number", "unknown")
+                print(
+                    f"Skipping subgroup with space group {spg}: "
+                    f"optimization failed: {exc}"
+                )
+                continue
+            
+            except Exception as exc:
+                spg = getattr(getattr(xtal_sub, "group", None), "number", "unknown")
+                print(
+                    f"Skipping subgroup with space group {spg}: "
+                    f"unexpected error: {type(exc).__name__}: {exc}"
+                )
+                continue
 
             if xtal_sub_opt is None or not xtal_sub_opt.check_validity(bu.criteria):
                 # print(f"Subgroup failed validity ({gtype}): {xtal_sub.formula}")
@@ -271,12 +326,44 @@ if __name__ == "__main__":
         help="Use discrete representation for Wyckoff positions with N_GRIDS resolution")
     parser.add_argument("--discrete_cell", action="store_true",
         help="Use discrete representation for cell parameters (requires --discrete)")
+    parser.add_argument(
+        "--prototype",
+        default="graphite",
+        help="Reference prototype for local environment, default: graphite"
+    )
+    parser.add_argument(
+        "--CN",
+        type=int,
+        default=3,
+        help="Target C coordination number, default: 3"
+    )
+    parser.add_argument(
+        "--rcut",
+        type=float,
+        default=2.0,
+        help="SO3 descriptor cutoff radius, default: 2.0"
+    )
+    parser.add_argument(
+        "--ncpu",
+        type=int,
+        default=1,
+        help="Number of CPU processes used to process source structures."
+    )
+    parser.add_argument(
+        "--chunksize",
+        type=int,
+        default=1,
+        help="Number of source structures assigned to a worker at once."
+    )
 
     args = parser.parse_args()
 
     # --- Setup ---
     random.seed(42) # Use a fixed seed for reproducibility
     np.random.seed(42)
+    
+    ncpu = max(1, args.ncpu)
+    chunksize = max(1, args.chunksize) 
 
     N_wp = args.max_wp
     N_atoms_max = args.max_atoms
@@ -289,6 +376,9 @@ if __name__ == "__main__":
     include_label_col = args.label
     discrete_cell = args.discrete_cell
     tag = args.tag
+    prototype = args.prototype
+    CN = args.CN
+    rcut = args.rcut
 
     if args.discrete is not None:
         use_discrete_rep = True
@@ -314,6 +404,11 @@ if __name__ == "__main__":
     print(f"Include Label Column: {include_label_col}")
     print(f"Discrete Rep: {use_discrete_rep} (Resolution: {discrete_resolution})")
     print(f"Discrete Cell: {discrete_cell}")
+    print(f"Reference Prototype: {prototype}")
+    print(f"Target CN: {CN}")
+    print(f"SO3 rcut: {rcut}")
+    print(f"CPU Processes: {ncpu}")
+    print(f"Multiprocessing Chunksize: {chunksize}")
     print("---------------------")
 
     # --- Load Data ---
@@ -332,7 +427,7 @@ if __name__ == "__main__":
     # Note: Other criteria (atoms, spg, dof, wp) are checked inside get_reps_from_xtal
     xtals_filtered = [
         xtal for xtal in xtals_all
-        if not load_energy_from_db or xtal.energy <= max_E # Apply energy filter if loaded
+        if not load_energy_from_db or getattr(xtal, "ff_energy", float("inf")) <= max_E
     ]
     print(f"Filtered to {len(xtals_filtered)} structures based on initial energy <= {max_E}")
 
@@ -350,27 +445,82 @@ if __name__ == "__main__":
         discrete_cell,
         discrete_resolution,
         eps_subgroup,
+        prototype,
+        CN,
+        rcut,
     )
 
     # --- Process Structures ---
     total_reps_list = []
     unique_xtal_processed = 0
-    print(f"Processing {len(xtals_filtered)} structures...")
-
-    for xtal in xtals_filtered:
-        result_reps = get_reps_from_xtal(xtal, params_tuple)
-        if len(result_reps) > 0:
+    failed_xtals = 0
+    
+    print(
+        f"Processing {len(xtals_filtered)} structures "
+        f"with {ncpu} CPU process(es)..."
+    )
+    
+    indexed_xtals = list(enumerate(xtals_filtered))
+    
+    worker = partial(
+        process_one_xtal,
+        params=params_tuple,
+    )
+    
+    if ncpu == 1:
+        results = map(worker, indexed_xtals)
+    else:
+        pool = Pool(processes=ncpu)
+        results = pool.imap_unordered(
+            worker,
+            indexed_xtals,
+            chunksize=chunksize,
+        )
+    
+    try:
+        for source_index, result_reps, error_message in results:
+            if error_message is not None:
+                failed_xtals += 1
+                print(
+                    f"Source structure {source_index} failed: "
+                    f"{error_message}"
+                )
+                continue
+    
+            if len(result_reps) == 0:
+                continue
+    
             unique_xtal_processed += 1
-        if include_label_col:
-            # Add label (index of the unique source structure)
-            labeled_reps = [np.append(rep, unique_xtal_processed) for rep in result_reps]
-            total_reps_list.extend(labeled_reps)
-        else:
-            total_reps_list.extend(result_reps)
-        print(f"Processed {unique_xtal_processed} strucs, {len(result_reps)} representations.")
+    
+            if include_label_col:
+                # Use original source index + 1 as a stable label.
+                label_value = source_index + 1
+                labeled_reps = [
+                    np.append(rep, label_value)
+                    for rep in result_reps
+                ]
+                total_reps_list.extend(labeled_reps)
+            else:
+                total_reps_list.extend(result_reps)
+    
+            print(
+                f"Completed source {source_index}: "
+                f"{len(result_reps)} representations; "
+                f"{unique_xtal_processed} usable sources total; "
+                f"{len(total_reps_list)} representations total."
+            )
+    
+    finally:
+        if ncpu > 1:
+            pool.close()
+            pool.join()
 
-    print(f"\nFinished processing.")
-    print(f"Generated representations from {unique_xtal_processed} unique structures.")
+    print("\nFinished processing.")
+    print(
+        f"Generated representations from "
+        f"{unique_xtal_processed} unique structures."
+    )
+    print(f"Failed source structures: {failed_xtals}")
     print(f"Total representations: {len(total_reps_list)}")
 
     # --- Save Results ---
