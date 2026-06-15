@@ -3,6 +3,7 @@
 import argparse
 import os
 import random
+from copy import deepcopy
 from functools import partial
 from multiprocessing import Pool
 
@@ -10,7 +11,7 @@ import numpy as np
 import pandas as pd
 from pyxtal import pyxtal
 from pyxtal.db import database_topology
-from pyxtal.lego.builder import builder
+from lego.builder import builder
 from pyxtal.util import new_struc_wo_energy
 
 
@@ -35,14 +36,127 @@ def make_builder(prototype="graphite", cn=3, rcut=2.0):
     bu = builder(["C"], [1], verbose=False)
     bu.set_descriptor_calculator(mykwargs={"rcut": rcut})
     bu.set_reference_enviroments(reference_structure)
-    bu.set_criteria(CN={"C": [cn]})
+    bu.set_target_coordination_references(
+        {
+            3: prototype_files[args.prototype_cn3],
+            4: prototype_files[args.prototype_cn4],
+        }
+    )
     return bu
+
+
+def copy_site_properties(source, target):
+    """Copy persistent atom-site metadata between equivalent PyXtal objects.
+
+    ``builder.optimize_xtal`` reconstructs a new PyXtal object from the
+    one-dimensional representation. Custom ``atom_site.property`` metadata is
+    therefore restored explicitly here.
+
+    The transfer is deliberately strict: it refuses to guess if optimization
+    changes the orbit count, species order, or Wyckoff labels.
+    """
+    source_sites = getattr(source, "atom_sites", [])
+    target_sites = getattr(target, "atom_sites", [])
+
+    if len(source_sites) != len(target_sites):
+        raise ValueError(
+            "Cannot transfer site properties: atom-site count changed from "
+            f"{len(source_sites)} to {len(target_sites)}."
+        )
+
+    for index, (old_site, new_site) in enumerate(
+        zip(source_sites, target_sites)
+    ):
+        old_species = str(getattr(old_site, "specie", ""))
+        new_species = str(getattr(new_site, "specie", ""))
+        old_wp = old_site.wp.get_label()
+        new_wp = new_site.wp.get_label()
+
+        if old_species != new_species or old_wp != new_wp:
+            raise ValueError(
+                "Cannot transfer site properties: atom-site ordering changed "
+                f"at index {index}: ({old_species}, {old_wp}) -> "
+                f"({new_species}, {new_wp})."
+            )
+
+        new_site.property = deepcopy(
+            getattr(old_site, "property", {}) or {}
+        )
+
+
+def target_coordination_vector(xtal, n_wp, missing_value=0):
+    """Return target coordination for each atom-site slot.
+
+    Occupied slots must define
+    ``site.property["target_coordination"]``. Unused padded slots are zero.
+    """
+    sites = getattr(xtal, "atom_sites", [])
+
+    if len(sites) > n_wp:
+        raise ValueError(
+            f"Structure has {len(sites)} atom sites, exceeding N_wp={n_wp}."
+        )
+
+    values = []
+    for index, site in enumerate(sites):
+        value = getattr(site, "target_coordination", None)
+
+        if value is None:
+            value = (getattr(site, "property", {}) or {}).get(
+                "target_coordination"
+            )
+
+        if value is None:
+            raise ValueError(
+                "Missing target_coordination for atom-site "
+                f"{index} ({site.specie}, {site.wp.get_label()})."
+            )
+
+        value = int(value)
+        if value <= 0:
+            raise ValueError(
+                "target_coordination must be a positive integer for occupied "
+                f"atom-site {index}; received {value}."
+            )
+
+        values.append(value)
+
+    values.extend([int(missing_value)] * (n_wp - len(values)))
+    return np.asarray(values, dtype=int)
+
+
+def append_target_coordination(representations, xtal, n_wp):
+    """Append fixed-width target-coordination columns to representation rows."""
+    labels = target_coordination_vector(xtal, n_wp)
+    expected_width = 7 + 4 * n_wp
+    output = []
+
+    for row_index, representation in enumerate(representations):
+        representation = np.asarray(representation)
+
+        if representation.ndim != 1:
+            raise ValueError(
+                f"Representation {row_index} is not one-dimensional: "
+                f"shape={representation.shape}."
+            )
+
+        if len(representation) != expected_width:
+            raise ValueError(
+                f"Representation {row_index} has width "
+                f"{len(representation)}; expected {expected_width} before "
+                "adding target coordination."
+            )
+
+        output.append(np.concatenate((representation, labels)))
+
+    return output
 
 
 def make_csv(
     total_reps,
     include_energy,
     include_label,
+    include_target_coordination,
     discrete,
     discrete_cell,
     n_wp,
@@ -68,6 +182,11 @@ def make_csv(
 
         if not discrete:
             float_cols.update([base + 1, base + 2, base + 3])
+
+    if include_target_coordination:
+        column_names.extend(
+            [f"target_coord{i}" for i in range(n_wp)]
+        )
 
     if include_energy:
         column_names.append("energy")
@@ -125,6 +244,7 @@ def get_reps_from_xtal(xtal, params):
         n_wp,
         max_per_structure,
         include_energy,
+        include_target_coordination,
         discrete,
         discrete_cell,
         discrete_resolution,
@@ -155,10 +275,20 @@ def get_reps_from_xtal(xtal, params):
     ):
         return xtal_reps
 
+    if include_target_coordination:
+        # Fail before expensive optimization if the database is not labelled.
+        target_coordination_vector(xtal, n_wp)
+
     current_energy = ff_energy if include_energy else None
 
     xtal_opt, _, _ = bu.optimize_xtal(xtal, add_db=False)
-    if xtal_opt is None or not xtal_opt.check_validity(bu.criteria):
+    if xtal_opt is None:
+        return xtal_reps
+
+    if include_target_coordination:
+        copy_site_properties(xtal, xtal_opt)
+
+    if not xtal_opt.check_validity(bu.criteria):
         return xtal_reps
 
     n_wps = len(xtal_opt.atom_sites)
@@ -174,6 +304,13 @@ def get_reps_from_xtal(xtal, params):
         discrete_cell=discrete_cell,
         N_grids=discrete_resolution,
     ) or []
+
+    if include_target_coordination:
+        reps_initial = append_target_coordination(
+            reps_initial,
+            xtal_opt,
+            n_wp,
+        )
 
     if include_energy and current_energy is not None:
         reps_initial = [
@@ -226,6 +363,10 @@ def get_reps_from_xtal(xtal, params):
             if not valid_geometry:
                 continue
 
+            if include_target_coordination:
+                # PyXtal subgroup operations should already propagate these.
+                target_coordination_vector(xtal_sub, n_wp)
+
             is_new = new_struc_wo_energy(
                 xtal_sub,
                 trial_xtals_cache,
@@ -254,10 +395,13 @@ def get_reps_from_xtal(xtal, params):
                 )
                 continue
 
-            if (
-                xtal_sub_opt is None
-                or not xtal_sub_opt.check_validity(bu.criteria)
-            ):
+            if xtal_sub_opt is None:
+                continue
+
+            if include_target_coordination:
+                copy_site_properties(xtal_sub, xtal_sub_opt)
+
+            if not xtal_sub_opt.check_validity(bu.criteria):
                 continue
 
             trial_xtals_cache.append(xtal_sub_opt)
@@ -279,6 +423,13 @@ def get_reps_from_xtal(xtal, params):
                 discrete_cell=discrete_cell,
                 N_grids=discrete_resolution,
             ) or []
+
+            if include_target_coordination:
+                reps_sub = append_target_coordination(
+                    reps_sub,
+                    xtal_sub_opt,
+                    n_wp,
+                )
 
             if include_energy and current_energy is not None:
                 reps_sub = [
@@ -363,6 +514,14 @@ def parse_args():
         help="Include ff_energy in the output CSV.",
     )
     parser.add_argument(
+        "--target-coordination",
+        action="store_true",
+        help=(
+            "Append target_coord0...target_coordN columns. Every occupied "
+            "atom site must define site.property['target_coordination']."
+        ),
+    )
+    parser.add_argument(
         "--discrete",
         type=int,
         metavar="N_GRIDS",
@@ -383,7 +542,7 @@ def parse_args():
         dest="cn",
         type=int,
         default=3,
-        help="Target carbon coordination number.",
+        help="Current global carbon coordination criterion.",
     )
     parser.add_argument(
         "--rcut",
@@ -408,6 +567,15 @@ def parse_args():
         type=int,
         default=42,
         help="Base random seed.",
+    )
+    parser.add_argument(
+        "--prototype-cn3",
+        default="graphite",
+    )
+    
+    parser.add_argument(
+        "--prototype-cn4",
+        default="diamond",
     )
 
     return parser.parse_args()
@@ -452,7 +620,6 @@ def main():
         args.discrete_cell,
     )
 
-    # Validate/create the destination before the expensive processing begins.
     os.makedirs(args.output_dir, exist_ok=True)
     write_test = os.path.join(args.output_dir, ".write_test")
     try:
@@ -475,13 +642,14 @@ def main():
     print(f"Maximum representations/source: {args.max_per_struc}")
     print(f"Include energy: {args.energy}")
     print(f"Include label: {args.label}")
+    print(f"Include target coordination: {args.target_coordination}")
     print(
         f"Discrete representation: {use_discrete} "
         f"(resolution: {discrete_resolution})"
     )
     print(f"Discrete cell: {args.discrete_cell}")
     print(f"Reference prototype: {args.prototype}")
-    print(f"Target CN: {args.cn}")
+    print(f"Global target CN criterion: {args.cn}")
     print(f"SO3 cutoff: {args.rcut}")
     print(f"CPU processes: {args.ncpu}")
     print(f"Multiprocessing chunksize: {args.chunksize}")
@@ -521,6 +689,7 @@ def main():
         args.max_wp,
         args.max_per_struc,
         args.energy,
+        args.target_coordination,
         use_discrete,
         args.discrete_cell,
         discrete_resolution,
@@ -620,6 +789,7 @@ def main():
         total_reps=total_reps,
         include_energy=args.energy,
         include_label=args.label,
+        include_target_coordination=args.target_coordination,
         discrete=use_discrete,
         discrete_cell=args.discrete_cell,
         n_wp=args.max_wp,
