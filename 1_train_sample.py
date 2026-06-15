@@ -1,5 +1,8 @@
+#!/usr/bin/env python3
+
 import argparse
 import os
+
 import numpy as np
 import pandas as pd
 import torch
@@ -7,86 +10,193 @@ import torch
 from lego.GAN import GAN
 from lego.VAE import VAE
 
-if __name__ == "__main__":
+
+def main():
     parser = argparse.ArgumentParser(description="Table Synthesizer")
-    parser.add_argument("--data", help="Input CSV data")
+
     parser.add_argument(
-        "--model", 
-        default="GAN", 
-        help="Models: supports GAN, VAE"
+        "--data",
+        required=True,
+        help="Input CSV dataset.",
+    )
+    parser.add_argument(
+        "--model",
+        choices=["GAN", "VAE", "gan", "vae"],
+        default="GAN",
+        help="Generative model: GAN or VAE.",
     )
     parser.add_argument(
         "--epochs",
         type=int,
         default=250,
-        help="Number of epochs for training (default: 250)",
+        help="Number of training epochs. Default: 250.",
     )
     parser.add_argument(
-        "--nbatch", 
-        type=int, 
-        default=500, 
-        help="Number of batch size for training")
-    parser.add_argument(
-        "--seed", 
-        type=int, 
-        default=42, 
-        help="Training seeds")
-    parser.add_argument(
-        "--cutoff", 
-        type=int, 
-        help="Cutoff number for training samples"
+        "--nbatch",
+        type=int,
+        default=500,
+        help="Training batch size. Default: 500.",
     )
     parser.add_argument(
-        "--sample", 
-        type=int, 
-        default=100000, 
-        help="Output sample size")
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed. Default: 42.",
+    )
+    parser.add_argument(
+        "--cutoff",
+        type=int,
+        default=None,
+        help="Optional maximum number of training rows.",
+    )
+    parser.add_argument(
+        "--sample",
+        type=int,
+        default=100000,
+        help="Number of synthetic rows to generate. Default: 100000.",
+    )
 
     args = parser.parse_args()
+
+    if not os.path.isfile(args.data):
+        raise FileNotFoundError(f"Input CSV does not exist: {args.data}")
+
+    if args.epochs <= 0:
+        raise ValueError("--epochs must be greater than zero.")
+
+    if args.nbatch <= 0:
+        raise ValueError("--nbatch must be greater than zero.")
+
+    if args.cutoff is not None and args.cutoff <= 0:
+        raise ValueError("--cutoff must be greater than zero.")
+
+    if args.sample is not None and args.sample <= 0:
+        raise ValueError("--sample must be greater than zero.")
+
+    model = args.model.upper()
+    data_name = os.path.splitext(os.path.basename(args.data))[0]
+
+    model_root = os.path.join("models", data_name)
+    sample_root = os.path.join("data", "sample")
+
+    os.makedirs(model_root, exist_ok=True)
+    os.makedirs(sample_root, exist_ok=True)
+
+    # Reproducibility
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(args.seed)
-        print("cuda is available")
-        cuda = True
-    else:
-        cuda = False
-    print(f"CUDA available: {torch.cuda.is_available()}")
+
+    cuda = torch.cuda.is_available()
+
+    if cuda:
+        torch.cuda.manual_seed_all(args.seed)
+        print("CUDA is available.")
+
+    print(f"CUDA available: {cuda}")
     print(f"CUDA device count: {torch.cuda.device_count()}")
-    if torch.cuda.is_available():
-        print(f"Current CUDA device: {torch.cuda.current_device()}")
-        print(f"Device name: {torch.cuda.get_device_name()}")
-    # Read data
+
+    if cuda:
+        current_device = torch.cuda.current_device()
+        print(f"Current CUDA device: {current_device}")
+        print(f"Device name: {torch.cuda.get_device_name(current_device)}")
+
+    # Read dataset
     df = pd.read_csv(args.data)
+
     if args.cutoff is not None and len(df) > args.cutoff:
-        print("Select only a few samples for quick test")
-        df = df[: args.cutoff]
+        print(
+            f"Selecting the first {args.cutoff} of "
+            f"{len(df)} rows for training."
+        )
+        df = df.iloc[:args.cutoff].copy()
 
-    print(f"Data shape {df.shape} \n")
-    print(f"Data Head \n {df.head()} \n")
+    if df.empty:
+        raise ValueError("Input dataset is empty after applying --cutoff.")
 
-    # Set up the categorical columns
+    required_columns = {
+        "spg",
+        "a",
+        "b",
+        "c",
+        "alpha",
+        "beta",
+        "gamma",
+        "x0",
+    }
+
+    missing_columns = required_columns - set(df.columns)
+
+    if missing_columns:
+        raise ValueError(
+            "Input CSV is missing required columns: "
+            f"{sorted(missing_columns)}"
+        )
+
+    print(f"Data shape: {df.shape}\n")
+    print(f"Data head:\n{df.head()}\n")
+
+    # Determine the number of Wyckoff-site groups.
+    #
+    # Expected layout:
+    # 7 lattice/symmetry columns +
+    # 4 columns per Wyckoff site:
+    # wp_i, x_i, y_i, z_i
+    non_base_columns = len(df.columns) - 7
+
+    if non_base_columns < 4 or non_base_columns % 4 != 0:
+        raise ValueError(
+            "Unexpected CSV column layout. Expected 7 base columns plus "
+            "4 columns per Wyckoff site, but found "
+            f"{len(df.columns)} total columns."
+        )
+
+    num_wps = non_base_columns // 4
+
+    # Set up categorical/discrete columns
     dis_cols = ["spg"]
-    num_wps = int((len(df.columns) - 7) / 4)
-    if abs(df['a'][0] - round(df['a'][0])) < 1e-2: 
+
+    first_a = df["a"].iloc[0]
+
+    if abs(first_a - round(first_a)) < 1e-2:
         discrete_cell = True
-        dis_cols.extend(['a', 'b', 'c', 'alpha', 'beta', 'gamma'])
+        dis_cols.extend(
+            ["a", "b", "c", "alpha", "beta", "gamma"]
+        )
     else:
         discrete_cell = False
 
-    discrete = df['x0'].max() >= 2.5 + 1e-3
+    discrete_coordinates = df["x0"].max() >= 2.5 + 1e-3
 
-    for i in range(num_wps): 
-        dis_cols.append('wp' + str(i))
-        if discrete:
-            dis_cols.append('x' + str(i))
-            dis_cols.append('y' + str(i))
-            dis_cols.append('z' + str(i))
-    #dis_cols.append('label')
+    for i in range(num_wps):
+        wp_col = f"wp{i}"
+        x_col = f"x{i}"
+        y_col = f"y{i}"
+        z_col = f"z{i}"
 
-    # Initialize synthesizer with specified parameters
-    os.makedirs("models", exist_ok=True)
-    model = args.model
+        site_columns = {wp_col, x_col, y_col, z_col}
+        missing_site_columns = site_columns - set(df.columns)
+
+        if missing_site_columns:
+            raise ValueError(
+                f"Missing columns for Wyckoff site {i}: "
+                f"{sorted(missing_site_columns)}"
+            )
+
+        dis_cols.append(wp_col)
+
+        if discrete_coordinates:
+            dis_cols.extend([x_col, y_col, z_col])
+
+    print(f"Number of Wyckoff slots: {num_wps}")
+    print(f"Discrete cell parameters: {discrete_cell}")
+    print(f"Discrete coordinates: {discrete_coordinates}")
+    print(f"Number of discrete columns: {len(dis_cols)}")
+    print(f"Discrete columns: {dis_cols}\n")
+
+    # Initialize synthesizer
+    model_folder = os.path.join(model_root, model)
+    os.makedirs(model_folder, exist_ok=True)
+
     if model == "GAN":
         synthesizer = GAN(
             embedding_dim=128,
@@ -103,7 +213,7 @@ if __name__ == "__main__":
             epochs=args.epochs,
             pac=10,
             cuda=cuda,
-            folder="models/GAN",
+            folder=model_folder,
         )
 
     elif model == "VAE":
@@ -117,25 +227,80 @@ if __name__ == "__main__":
             verbose=True,
             cuda=cuda,
             batch_size=args.nbatch,
-            folder = "models/VAE",
+            folder=model_folder,
         )
+
     else:
-        raise RuntimeError("Only supports GAN/VAE, not", model)
+        raise RuntimeError(
+            f"Only GAN and VAE are supported, not {args.model}"
+        )
 
-    # Train models
-    synthesizer.fit(df, discrete_columns=dis_cols)
+    print(f"Training {model} model.")
+    print(f"Model output directory: {model_folder}")
 
-    # Output is stored in synthetic_data
-    if args.sample is None:
-        synthetic_data_size = len(df)
-    else:
-        synthetic_data_size = args.sample
-    df_synthetic = synthesizer.sample(samples=synthetic_data_size)
+    synthesizer.fit(
+        df,
+        discrete_columns=dis_cols,
+    )
 
-    print(f"(synthetic data sample\n {df_synthetic.head(10)}\n")
-    os.makedirs("data/sample", exist_ok=True)
-    output_file = f"data/sample/{args.model}-dis{len(dis_cols)}-{args.sample}.csv"
-    print(f"Save {synthetic_data_size} samples to {output_file}")
-    df_synthetic.columns = df_synthetic.columns.str.replace(" ", "")
-    df_synthetic = df_synthetic.map(lambda x: str(x).replace(",", " "))
-    df_synthetic.to_csv(output_file, index=False, header=True)
+    # Generate synthetic rows
+    synthetic_data_size = (
+        len(df) if args.sample is None else args.sample
+    )
+
+    print(f"Generating {synthetic_data_size} synthetic rows.")
+
+    df_synthetic = synthesizer.sample(
+        samples=synthetic_data_size
+    )
+
+    if df_synthetic is None or len(df_synthetic) == 0:
+        raise RuntimeError("The synthesizer returned no synthetic samples.")
+
+    print(
+        "Synthetic data sample:\n"
+        f"{df_synthetic.head(10)}\n"
+    )
+
+    output_file = os.path.join(
+        sample_root,
+        (
+            f"{data_name}-{model}-dis{len(dis_cols)}-"
+            f"seed{args.seed}-{synthetic_data_size}.csv"
+        ),
+    )
+
+    # Create the exact parent directory before saving.
+    output_parent = os.path.dirname(output_file)
+
+    if output_parent:
+        os.makedirs(output_parent, exist_ok=True)
+
+    print(
+        f"Saving {synthetic_data_size} samples to "
+        f"{output_file}"
+    )
+
+    df_synthetic.columns = (
+        df_synthetic.columns
+        .astype(str)
+        .str.replace(" ", "", regex=False)
+    )
+
+    # Replace commas embedded inside cell values so they do not interfere
+    # with the CSV representation.
+    df_synthetic = df_synthetic.map(
+        lambda value: str(value).replace(",", " ")
+    )
+
+    df_synthetic.to_csv(
+        output_file,
+        index=False,
+        header=True,
+    )
+
+    print(f"Saved synthetic dataset: {output_file}")
+
+
+if __name__ == "__main__":
+    main()
