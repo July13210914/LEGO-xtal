@@ -588,8 +588,13 @@ def minimize_from_x(
     
         return xtal, (x0, res.x)
     
-    except Exception:
-        return None
+    except Exception as exc:
+        print(
+            "Failed to reconstruct optimized structure:",
+            type(exc).__name__,
+            exc,
+        )
+        raise
 
 
 
@@ -865,19 +870,28 @@ class builder(object):
         return g.number, sites, dof
 
     def get_similarity(self, xtal):
-        """
-        Compute the similrity for a given xtal
-        QZ: call calculate_S()
-
-        Args:
-            xtal: pyxtal object
-
-        Returns:
-            the similarity value .w.r.t the reference environment
-        """
+        """Compute similarity using global or site-specific references."""
         x = xtal.get_1d_rep_x()
-        return calculate_S(x, xtal, self.ref_environments,
-                           self.calculator)
+    
+        if self.use_target_coordination:
+            targets = get_target_coordination_vector(
+                xtal,
+                strict=True,
+            )
+    
+            ref_environments = build_site_reference_matrix(
+                targets,
+                self.reference_environment_bank,
+            )
+        else:
+            ref_environments = self.ref_environments
+    
+        return calculate_S(
+            x,
+            xtal,
+            ref_environments,
+            self.calculator,
+        )
 
     def process_xtals(self, xtals, xs, add_db, symmetrize):
         # Now process each of the results
@@ -1023,10 +1037,28 @@ class builder(object):
                         xtal = xtals[id]
                         x = xtal.get_1d_rep_x()
                         spg, wps, _ = self.get_input_from_ref_xtal(xtal)
-                        targets = get_target_coordination_vector(
-                            xtal,
-                            strict=True,
-                        )
+                        if self.use_target_coordination:
+                            targets = get_target_coordination_vector(
+                                xtal,
+                                strict=True,
+                            )
+                        
+                            wp_libs.append(
+                                (
+                                    x,
+                                    xtal.group.number,
+                                    wps,
+                                    targets,
+                                )
+                            )
+                        else:
+                            wp_libs.append(
+                                (
+                                    x,
+                                    xtal.group.number,
+                                    wps,
+                                )
+                            )
                         
                         wp_libs.append(
                             (
