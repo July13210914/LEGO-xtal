@@ -27,22 +27,39 @@ def build_output_filename(output_dir, tag, discrete, discrete_cell):
     return os.path.join(output_dir, f"{tag}{suffix}")
 
 
-def make_builder(prototype="graphite", cn=3, rcut=2.0):
-    """Create and configure a LEGO builder for carbon environments."""
-    reference = pyxtal()
-    reference.from_prototype(prototype)
-    reference_structure = reference.to_pymatgen()
+def make_builder(
+    prototype_cn3="graphite",
+    prototype_cn4="diamond",
+    rcut=2.0,
+):
+    """Create a carbon builder with site-specific CN3/CN4 references."""
+    reference_cn3 = pyxtal()
+    reference_cn3.from_prototype(prototype_cn3)
 
-    bu = builder(["C"], [1], verbose=False)
-    bu.set_descriptor_calculator(mykwargs={"rcut": rcut})
-    bu.set_reference_enviroments(reference_structure)
-    bu.set_target_coordination_references(
-        {
-            3: prototype_files[args.prototype_cn3],
-            4: prototype_files[args.prototype_cn4],
+    reference_cn4 = pyxtal()
+    reference_cn4.from_prototype(prototype_cn4)
+
+    bu = builder(
+        ["C"],
+        [1],
+        verbose=False,
+    )
+
+    bu.set_descriptor_calculator(
+        mykwargs={
+            "rcut": rcut,
         }
     )
+
+    bu.set_target_coordination_references(
+        {
+            3: reference_cn3.to_pymatgen(),
+            4: reference_cn4.to_pymatgen(),
+        }
+    )
+
     return bu
+
 
 
 def copy_site_properties(source, target):
@@ -249,12 +266,16 @@ def get_reps_from_xtal(xtal, params):
         discrete_cell,
         discrete_resolution,
         subgroup_eps,
-        prototype,
-        cn,
+        prototype_cn3,
+        prototype_cn4,
         rcut,
     ) = params
 
-    bu = make_builder(prototype=prototype, cn=cn, rcut=rcut)
+    bu = make_builder(
+        prototype_cn3=prototype_cn3,
+        prototype_cn4=prototype_cn4,
+        rcut=rcut,
+    )
     xtal_reps = []
 
     atom_count = sum(xtal.numIons)
@@ -533,18 +554,6 @@ def parse_args():
         help="Discretize cell parameters; requires --discrete.",
     )
     parser.add_argument(
-        "--prototype",
-        default="graphite",
-        help="Reference prototype for the local environment.",
-    )
-    parser.add_argument(
-        "--CN",
-        dest="cn",
-        type=int,
-        default=3,
-        help="Current global carbon coordination criterion.",
-    )
-    parser.add_argument(
         "--rcut",
         type=float,
         default=2.0,
@@ -648,8 +657,9 @@ def main():
         f"(resolution: {discrete_resolution})"
     )
     print(f"Discrete cell: {args.discrete_cell}")
-    print(f"Reference prototype: {args.prototype}")
-    print(f"Global target CN criterion: {args.cn}")
+    print(f"CN3 reference prototype: {args.prototype_cn3}")
+    print(f"CN4 reference prototype: {args.prototype_cn4}")
+    print("Coordination criterion: per-site target_coordination")
     print(f"SO3 cutoff: {args.rcut}")
     print(f"CPU processes: {args.ncpu}")
     print(f"Multiprocessing chunksize: {args.chunksize}")
@@ -694,8 +704,8 @@ def main():
         args.discrete_cell,
         discrete_resolution,
         5e-4,
-        args.prototype,
-        args.cn,
+        args.prototype_cn3,
+        args.prototype_cn4,
         args.rcut,
     )
 
