@@ -588,13 +588,8 @@ def minimize_from_x(
     
         return xtal, (x0, res.x)
     
-    except Exception as exc:
-        print(
-            "Failed to reconstruct optimized structure:",
-            type(exc).__name__,
-            exc,
-        )
-        raise
+    except Exception:
+        return None
 
 
 
@@ -872,20 +867,16 @@ class builder(object):
     def get_similarity(self, xtal):
         """Compute similarity using global or site-specific references."""
         x = xtal.get_1d_rep_x()
-    
+
         if self.use_target_coordination:
-            targets = get_target_coordination_vector(
-                xtal,
-                strict=True,
-            )
-    
+            targets = get_target_coordination_vector(xtal, strict=True)
             ref_environments = build_site_reference_matrix(
                 targets,
                 self.reference_environment_bank,
             )
         else:
             ref_environments = self.ref_environments
-    
+
         return calculate_S(
             x,
             xtal,
@@ -912,9 +903,11 @@ class builder(object):
                 valid_xtals.append(xtal)
                 sim1 = self.get_similarity(xtal)
                 if symmetrize:
+                    pre_symmetrize = xtal
                     pmg = xtal.to_pymatgen()
                     xtal = pyxtal()
                     xtal.from_seed(pmg)
+                    self._copy_site_properties(pre_symmetrize, xtal)
                 if add_db:
                     self.process_xtal(xtal, [0, sim1], count, xs=_xs)
                     count += 1
@@ -1042,7 +1035,6 @@ class builder(object):
                                 xtal,
                                 strict=True,
                             )
-                        
                             wp_libs.append(
                                 (
                                     x,
@@ -1059,15 +1051,6 @@ class builder(object):
                                     wps,
                                 )
                             )
-                        
-                        wp_libs.append(
-                            (
-                                x,
-                                xtal.group.number,
-                                wps,
-                                targets,
-                            )
-                        )
                     yield (
                         self.dim,
                         wp_libs,
@@ -1206,9 +1189,19 @@ class builder(object):
                             wp_libs.append((x, spg, wps))
                         except:
                             print("Trouble in from_tabular_representation")
-                    yield (self.dim, wp_libs, self.elements, self.calculator,
-                           self.ref_environments, opt_type, T, niter,
-                           early_quit, minimizers)
+                    yield (
+                        self.dim,
+                        wp_libs,
+                        self.elements,
+                        self.calculator,
+                        self.ref_environments,
+                        self.reference_environment_bank,
+                        opt_type,
+                        T,
+                        niter,
+                        early_quit,
+                        minimizers,
+                    )
 
             # Use the generator to pass args to reduce memory usage
             _xtal, _xs = None, None
@@ -1786,3 +1779,4 @@ if __name__ == "__main__":
             xtals.append(xtal)
             bu.optimize_xtal(xtal)
         bu.optimize_xtals(xtals)
+

@@ -3,7 +3,6 @@
 import argparse
 import os
 import random
-from copy import deepcopy
 from functools import partial
 from multiprocessing import Pool
 
@@ -39,67 +38,15 @@ def make_builder(
     reference_cn4 = pyxtal()
     reference_cn4.from_prototype(prototype_cn4)
 
-    bu = builder(
-        ["C"],
-        [1],
-        verbose=False,
-    )
-
-    bu.set_descriptor_calculator(
-        mykwargs={
-            "rcut": rcut,
-        }
-    )
-
+    bu = builder(["C"], [1], verbose=False)
+    bu.set_descriptor_calculator(mykwargs={"rcut": rcut})
     bu.set_target_coordination_references(
         {
             3: reference_cn3.to_pymatgen(),
             4: reference_cn4.to_pymatgen(),
         }
     )
-
     return bu
-
-
-
-def copy_site_properties(source, target):
-    """Copy persistent atom-site metadata between equivalent PyXtal objects.
-
-    ``builder.optimize_xtal`` reconstructs a new PyXtal object from the
-    one-dimensional representation. Custom ``atom_site.property`` metadata is
-    therefore restored explicitly here.
-
-    The transfer is deliberately strict: it refuses to guess if optimization
-    changes the orbit count, species order, or Wyckoff labels.
-    """
-    source_sites = getattr(source, "atom_sites", [])
-    target_sites = getattr(target, "atom_sites", [])
-
-    if len(source_sites) != len(target_sites):
-        raise ValueError(
-            "Cannot transfer site properties: atom-site count changed from "
-            f"{len(source_sites)} to {len(target_sites)}."
-        )
-
-    for index, (old_site, new_site) in enumerate(
-        zip(source_sites, target_sites)
-    ):
-        old_species = str(getattr(old_site, "specie", ""))
-        new_species = str(getattr(new_site, "specie", ""))
-        old_wp = old_site.wp.get_label()
-        new_wp = new_site.wp.get_label()
-
-        if old_species != new_species or old_wp != new_wp:
-            raise ValueError(
-                "Cannot transfer site properties: atom-site ordering changed "
-                f"at index {index}: ({old_species}, {old_wp}) -> "
-                f"({new_species}, {new_wp})."
-            )
-
-        new_site.property = deepcopy(
-            getattr(old_site, "property", {}) or {}
-        )
-
 
 def target_coordination_vector(xtal, n_wp, missing_value=0):
     """Return target coordination for each atom-site slot.
@@ -306,9 +253,6 @@ def get_reps_from_xtal(xtal, params):
     if xtal_opt is None:
         return xtal_reps
 
-    if include_target_coordination:
-        copy_site_properties(xtal, xtal_opt)
-
     if not xtal_opt.check_validity(bu.criteria):
         return xtal_reps
 
@@ -418,9 +362,6 @@ def get_reps_from_xtal(xtal, params):
 
             if xtal_sub_opt is None:
                 continue
-
-            if include_target_coordination:
-                copy_site_properties(xtal_sub, xtal_sub_opt)
 
             if not xtal_sub_opt.check_validity(bu.criteria):
                 continue
@@ -580,11 +521,12 @@ def parse_args():
     parser.add_argument(
         "--prototype-cn3",
         default="graphite",
+        help="Prototype defining the target-CN3 SO3 environment.",
     )
-    
     parser.add_argument(
         "--prototype-cn4",
         default="diamond",
+        help="Prototype defining the target-CN4 SO3 environment.",
     )
 
     return parser.parse_args()
@@ -608,6 +550,12 @@ def main():
         raise ValueError("--chunksize must be at least 1.")
     if args.discrete is not None and args.discrete < 2:
         raise ValueError("--discrete must be at least 2.")
+
+    if not args.target_coordination:
+        raise ValueError(
+            "This mixed-coordination workflow requires "
+            "--target-coordination."
+        )
 
     if args.discrete_cell and args.discrete is None:
         print(
@@ -811,4 +759,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
