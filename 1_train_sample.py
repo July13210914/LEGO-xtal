@@ -111,7 +111,7 @@ def validate_joint_layout(df):
 
 
 def validate_target_coordination(df, num_wps):
-    """Validate consistency between occupied WP slots and CN3/CN4 labels."""
+    """Validate consistency between occupied WP slots and coordination labels."""
     errors = []
 
     for index in range(num_wps):
@@ -134,11 +134,11 @@ def validate_target_coordination(df, num_wps):
         occupied = wp_values != -1
         empty = ~occupied
 
-        invalid_occupied = occupied & ~target_values.isin([3, 4])
+        invalid_occupied = occupied & (target_values <= 0)
         if invalid_occupied.any():
             rows = invalid_occupied[invalid_occupied].index[:10].tolist()
             errors.append(
-                f"{target_col} must be 3 or 4 for occupied {wp_col} slots; "
+                f"{target_col} must be a positive integer for occupied {wp_col} slots; "
                 f"invalid rows {rows}"
             )
 
@@ -157,27 +157,28 @@ def validate_target_coordination(df, num_wps):
 
 
 def print_target_statistics(df, num_wps):
-    """Print compact diagnostics for the joint CN3/CN4 training labels."""
+    """Print compact diagnostics for the joint coordination labels."""
     target_columns = [f"target_coord{i}" for i in range(num_wps)]
     values = df[target_columns].to_numpy(dtype=int)
 
     occupied = values > 0
-    cn3_count = int(np.sum(values == 3))
-    cn4_count = int(np.sum(values == 4))
     occupied_count = int(np.sum(occupied))
-
-    rows_with_cn3 = np.any(values == 3, axis=1)
-    rows_with_cn4 = np.any(values == 4, axis=1)
-    mixed_rows = rows_with_cn3 & rows_with_cn4
+    unique_targets, target_counts = np.unique(values[occupied], return_counts=True)
+    rows_with_multiple_targets = np.sum(
+        [len(set(row[row > 0])) > 1 for row in values]
+    )
 
     patterns, counts = np.unique(values, axis=0, return_counts=True)
     order = np.argsort(counts)[::-1]
 
     print("Target-coordination statistics:")
     print(f"  Occupied site labels: {occupied_count}")
-    print(f"  CN3 labels: {cn3_count}")
-    print(f"  CN4 labels: {cn4_count}")
-    print(f"  Mixed CN3/CN4 rows: {int(np.sum(mixed_rows))} / {len(df)}")
+    for target, count in zip(unique_targets, target_counts):
+        print(f"  CN{int(target)} labels: {int(count)}")
+    print(
+        "  Rows with multiple occupied target values: "
+        f"{int(rows_with_multiple_targets)} / {len(df)}"
+    )
     print(f"  Unique padded target patterns: {len(patterns)}")
     print("  Most common target patterns:")
 
@@ -231,7 +232,7 @@ def decode_skeleton_token(df, num_wps):
 
     token_values = decoded[token_col].astype(str).str.strip()
     expected_pattern = r"^(-?\d+)" + "".join(
-        [r"\|(-?\d+):([034])" for _ in range(num_wps)]
+        [r"\|(-?\d+):(\d+)" for _ in range(num_wps)]
     ) + r"$"
     parts = token_values.str.extract(expected_pattern)
 
@@ -683,4 +684,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 

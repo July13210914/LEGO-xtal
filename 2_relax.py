@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""Decode, mixed-CN SO3-relax, and optionally post-process LEGO samples.
+"""Decode, SiO2 coordination-relax, and post-process LEGO samples.
 
-This version supports unconditional joint samples containing
-``target_coord0 ... target_coordN``.  Each occupied independent site is
-assigned a target coordination of 3 or 4.  The LEGO builder then compares
-CN3 sites with a graphite SO3 reference and CN4 sites with a diamond SO3
-reference, and performs strict post-optimization coordination validation.
+Each occupied independent site carries a target coordination.  For the fixed
+silica template, Si sites target four heteronuclear neighbours and O sites
+target two heteronuclear neighbours.  A tetrahedral SiO2 reference supplies
+species-specific SO3 environments for the pre-relaxation.
 """
 
 import argparse
@@ -21,6 +20,8 @@ import pandas as pd
 from ase.db import connect
 from pyxtal import pyxtal
 from pyxtal.db import database_topology
+from pyxtal.lattice import Lattice
+from pyxtal.symmetry import Group
 from tqdm import tqdm
 
 from lego.builder import builder, set_target_coordination
@@ -100,9 +101,9 @@ def validate_and_extract_targets(row, site_indices):
                 f"slot {index}: occupied site occurs after an empty slot"
             )
 
-        if target not in (3, 4):
+        if target not in (2, 4):
             raise ValueError(
-                f"slot {index}: occupied site requires target 3 or 4, "
+                f"slot {index}: occupied site requires target 2 or 4, "
                 f"got {target}"
             )
 
@@ -249,12 +250,164 @@ def map_targets_to_decoded_sites(xtal, requested, policy):
         record["slot"] for record in requested
         if record["slot"] not in used_slots
     ]
+
+    allowed = {"Si": 4, "O": 2}
     for site, record in assignments:
-        set_target_coordination(site, record["target"])
+        symbol = str(site.specie)
+        expected = allowed.get(symbol)
+        if expected is None:
+            raise ValueError(
+                f"Unsupported decoded species {site.specie!r}; expected Si/O."
+            )
+        if int(record["target"]) != expected:
+            raise ValueError(
+                f"Decoded {symbol} site requires target CN={expected}, "
+                f"received {record['target']}."
+            )
+        set_target_coordination(site, int(record["target"]))
+
+    composition = {
+        str(specie): int(count)
+        for specie, count in zip(xtal.species, xtal.numIons)
+    }
+    n_si = composition.get("Si", 0)
+    n_o = composition.get("O", 0)
+    if n_si <= 0 or n_o != 2 * n_si:
+        raise ValueError(
+            "Decoded/repaired structure is not stoichiometric SiO2: "
+            f"composition={composition}."
+        )
 
     mapped_targets = [record["target"] for _site, record in assignments]
     return mapped_targets, dropped, requested_wps, decoded_wps
 
+
+
+def build_sio2_from_tabular(
+    rep,
+    requested,
+    discrete,
+    discrete_cell,
+    discrete_res,
+    max_abc=50.0,
+    max_angle=180.0,
+):
+    """Build a binary SiO2 PyXtal directly from a tabular representation."""
+    rep = np.asarray(rep, dtype=float)
+    number = int(round(float(rep[0])))
+    if not 1 <= number <= 230:
+        raise ValueError(f"Invalid space-group number: {number}")
+
+    group = Group(number)
+    a, b, c, alpha, beta, gamma = [float(v) for v in rep[1:7]]
+
+    if discrete_cell:
+        if discrete_res is None:
+            raise ValueError("discrete_cell=True requires a grid resolution")
+        a = a / discrete_res * max_abc
+        b = b / discrete_res * max_abc
+        c = c / discrete_res * max_abc
+        alpha = alpha / discrete_res * max_angle
+        beta = beta / discrete_res * max_angle
+        gamma = gamma / discrete_res * max_angle
+    else:
+        alpha, beta, gamma = np.degrees([alpha, beta, gamma])
+
+    lattice = Lattice.from_para(
+        a,
+        b,
+        c,
+        alpha,
+        beta,
+        gamma,
+        ltype=group.lattice_type,
+        force_symmetry=True,
+    )
+
+    species_for_target = {4: "Si", 2: "O"}
+    sites_by_species = {"Si": [], "O": []}
+    num_ions = {"Si": 0, "O": 0}
+
+    site_rows = np.reshape(rep[7:], (-1, 4))
+    requested_by_slot = {int(item["slot"]): item for item in requested}
+
+    for slot, site_info in enumerate(site_rows):
+        record = requested_by_slot.get(slot)
+        if record is None:
+            continue
+
+        wp_id, x, y, z = site_info
+        wp_id = int(round(float(wp_id)))
+        if wp_id < 0 or wp_id >= len(group):
+            continue
+
+        wp = group[wp_id]
+        if discrete:
+            if discrete_res is None:
+                raise ValueError("discrete=True requires a grid resolution")
+            x, y, z = wp.from_discrete_grid(
+                [float(x), float(y), float(z)],
+                discrete_res,
+            )
+
+        xyz = wp.search_generator(
+            [float(x), float(y), float(z)],
+            tol=0.01 if not discrete else 0.1,
+            symmetrize=True,
+        )
+        if xyz is None:
+            continue
+
+        target = int(record["target"])
+        if target not in species_for_target:
+            raise ValueError(
+                f"Unsupported target coordination {target}; expected 2 or 4."
+            )
+        symbol = species_for_target[target]
+
+        sites_by_species[symbol].append(
+            (wp.get_label(), float(xyz[0]), float(xyz[1]), float(xyz[2]))
+        )
+        num_ions[symbol] += int(wp.multiplicity)
+
+    if not sites_by_species["Si"] or not sites_by_species["O"]:
+        raise ValueError(
+            "Binary decoding lost one species before PyXtal build: "
+            f"Si sites={len(sites_by_species['Si'])}, "
+            f"O sites={len(sites_by_species['O'])}."
+        )
+
+    if num_ions["O"] != 2 * num_ions["Si"]:
+        raise ValueError(
+            "Decoded Wyckoff multiplicities do not satisfy SiO2: "
+            f"Si={num_ions['Si']}, O={num_ions['O']}."
+        )
+
+    xtal = pyxtal()
+    xtal.build(
+        group,
+        ["Si", "O"],
+        [num_ions["Si"], num_ions["O"]],
+        lattice,
+        [sites_by_species["Si"], sites_by_species["O"]],
+    )
+
+    if not xtal.valid or len(xtal.atom_sites) == 0:
+        raise ValueError("PyXtal returned an invalid or empty binary structure")
+
+    composition = {
+        str(specie): int(count)
+        for specie, count in zip(xtal.species, xtal.numIons)
+    }
+    n_si = composition.get("Si", 0)
+    n_o = composition.get("O", 0)
+    if n_si <= 0 or n_o != 2 * n_si:
+        raise ValueError(
+            "Built PyXtal composition is not SiO2: "
+            f"composition={composition}."
+        )
+
+    return xtal
 
 def decode_row(
     item,
@@ -276,18 +429,17 @@ def decode_row(
             dtype=float,
         )
 
-        xtal = pyxtal()
-        xtal.from_tabular_representation(
+        xtal = build_sio2_from_tabular(
             rep,
-            normalize=False,
+            requested,
             discrete=discrete,
             discrete_cell=discrete_cell,
-            N_grids=discrete_res,
+            discrete_res=discrete_res,
         )
 
         if not xtal.valid or len(xtal.atom_sites) == 0:
             return row_index, None, None, None, (
-                "PyXtal returned an invalid or empty structure"
+                "PyXtal returned an invalid or empty binary structure"
             ), None
 
         targets, dropped_slots, requested_wps, decoded_wps = (
@@ -358,8 +510,8 @@ def write_prototype_cif(name, output_path):
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
-            "Decode and site-specifically SO3-relax mixed CN3/CN4 "
-            "LEGO-Xtal samples."
+            "Decode and species-specifically SO3-relax tetrahedral "
+            "SiO2 LEGO-Xtal samples."
         )
     )
 
@@ -382,14 +534,13 @@ def parse_args():
         help="Reference source database used for overlap checking.",
     )
     parser.add_argument(
-        "--prototype-cn3",
-        default="graphite",
-        help="PyXtal prototype used for target CN3 sites.",
-    )
-    parser.add_argument(
-        "--prototype-cn4",
-        default="diamond",
-        help="PyXtal prototype used for target CN4 sites.",
+        "--reference-sio2",
+        required=False,
+        default=None,
+        help=(
+            "Reference tetrahedral SiO2 CIF. Required unless --resume-db "
+            "is supplied."
+        ),
     )
     parser.add_argument(
         "--rcut",
@@ -489,8 +640,7 @@ def main():
     print(f"Output directory: {output_dir}")
     print(f"Rows: {args.begin} to {args.end}")
     print(f"CPU processes: {args.ncpu}")
-    print(f"CN3 reference prototype: {args.prototype_cn3}")
-    print(f"CN4 reference prototype: {args.prototype_cn4}")
+    print(f"SiO2 reference: {args.reference_sio2}")
     print(f"SO3 cutoff: {args.rcut}")
     print(f"Site repair policy: {args.site_repair_policy}")
     print(f"Skip topology: {args.skip_topology}")
@@ -635,28 +785,32 @@ def main():
         xtals = [item[1] for item in decoded]
 
         bu = builder(
-            ["C"],
-            [1],
+            ["Si", "O"],
+            [1, 2],
             rank=rank,
             prefix=os.path.join(output_dir, "mof"),
         )
         bu.set_descriptor_calculator(mykwargs={"rcut": args.rcut})
 
-        reference_dir = os.path.join(output_dir, "references")
-        os.makedirs(reference_dir, exist_ok=True)
-        cn3_cif = write_prototype_cif(
-            args.prototype_cn3,
-            os.path.join(reference_dir, "cn3_reference.cif"),
+        if args.reference_sio2 is None:
+            raise ValueError(
+                "--reference-sio2 is required for SiO2 SO3 optimization."
+            )
+        if not os.path.isfile(args.reference_sio2):
+            raise FileNotFoundError(
+                f"SiO2 reference not found: {args.reference_sio2}"
+            )
+
+        bu.set_target_coordination_references(
+            {
+                ("Si", 4): args.reference_sio2,
+                ("O", 2): args.reference_sio2,
+            }
         )
-        cn4_cif = write_prototype_cif(
-            args.prototype_cn4,
-            os.path.join(reference_dir, "cn4_reference.cif"),
-        )
-        bu.set_target_coordination_references({3: cn3_cif, 4: cn4_cif})
 
         print(
-            f"Optimizing {n_decoded} structures with site-specific CN3/CN4 "
-            f"references using {args.ncpu} CPU process(es)."
+            f"Optimizing {n_decoded} structures with Si->O4 and O->Si2 "
+            f"SO3 references using {args.ncpu} CPU process(es)."
         )
 
         optimization_start = time()
@@ -721,7 +875,7 @@ def main():
         empty_db.metadata = {
             "stage": "final",
             "status": "empty",
-            "reason": "no structures passed mixed-coordination optimization",
+            "reason": "no structures passed SiO2 coordination optimization",
             "source_csv": args.csv,
         }
         n_unique = 0
@@ -794,8 +948,8 @@ def main():
     with open(metric_path, "w", encoding="utf-8") as handle:
         handle.write(f"Source data: {args.csv}\n")
         handle.write(f"Resume database: {args.resume_db}\n")
-        handle.write(f"CN3 reference prototype: {args.prototype_cn3}\n")
-        handle.write(f"CN4 reference prototype: {args.prototype_cn4}\n")
+        handle.write(f"SiO2 reference: {args.reference_sio2}\n")
+        handle.write("Coordination templates: Si->O4; O->Si2\n")
         handle.write(f"SO3 cutoff: {args.rcut}\n")
         handle.write(f"Site repair policy: {args.site_repair_policy}\n")
         handle.write(f"N_repaired_xtal: {n_repaired:12d}\n")

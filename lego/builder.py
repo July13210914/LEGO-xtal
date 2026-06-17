@@ -102,23 +102,38 @@ def restore_target_coordination(xtal, targets):
         set_target_coordination(site, target)
 
 
-def build_site_reference_matrix(targets, reference_bank):
+def build_site_reference_matrix(targets, reference_bank, sites=None):
     """Build one SO3 reference row per independent atom site."""
     if reference_bank is None:
         raise ValueError("No target-coordination reference bank was defined.")
 
     refs = []
 
+    if sites is not None and len(sites) != len(targets):
+        raise ValueError(
+            "Site count does not match target-coordination count: "
+            f"{len(sites)} versus {len(targets)}."
+        )
+
     for index, target in enumerate(targets):
         target = int(target)
+        specie = None
+        if sites is not None:
+            site = sites[index]
+            specie = site[0] if isinstance(site, tuple) else site.specie
+            specie = str(specie)
 
-        if target not in reference_bank:
+        key = (specie, target) if specie is not None else target
+        if key not in reference_bank and target in reference_bank:
+            key = target
+
+        if key not in reference_bank:
             raise ValueError(
-                f"No reference environment exists for target CN={target} "
-                f"at atom site {index}."
+                "No reference environment exists for "
+                f"site {index} ({specie}, CN={target})."
             )
 
-        ref = np.asarray(reference_bank[target], dtype=float)
+        ref = np.asarray(reference_bank[key], dtype=float)
 
         if ref.ndim == 2:
             if ref.shape[0] != 1:
@@ -142,7 +157,7 @@ def build_site_reference_matrix(targets, reference_bank):
 def check_target_coordination(xtal, verbose=False):
     """Validate actual coordination against each site's persistent target."""
     try:
-        xtal.set_site_coordination()
+        xtal.set_site_coordination(exclude_ii=len(xtal.species) > 1)
     except Exception as exc:
         if verbose:
             print(
@@ -389,6 +404,7 @@ def minimize_from_x(
         ref_envs = build_site_reference_matrix(
             target_coordination,
             reference_environment_bank,
+            sites=sites,
         )
     
     # Original element-specific mode.
@@ -736,17 +752,12 @@ class builder(object):
         references,
         substitute=None,
     ):
-        """Set one prototype SO3 environment for each target coordination.
+        """Set site-reference SO3 environments.
 
-        Parameters
-        ----------
-        references : dict
-            Mapping such as:
-
-                {
-                    3: "graphite.cif",
-                    4: "diamond.cif",
-                }
+        Keys may be integer coordination targets for elemental systems or
+        ``(central_species, target_coordination)`` tuples for compounds.
+        A compound reference CIF may be reused for multiple keys; the SO3
+        descriptor is extracted at the first atom of the requested species.
         """
         if self.calculator is None:
             raise RuntimeError(
@@ -755,8 +766,20 @@ class builder(object):
 
         bank = {}
 
-        for target, cif_file in references.items():
-            target = int(target)
+        for raw_key, cif_file in references.items():
+            if isinstance(raw_key, tuple):
+                if len(raw_key) != 2:
+                    raise ValueError(
+                        "Compound reference keys must be "
+                        "(central_species, target_coordination)."
+                    )
+                central_species = str(raw_key[0])
+                target = int(raw_key[1])
+                key = (central_species, target)
+            else:
+                central_species = self.elements[0]
+                target = int(raw_key)
+                key = target
 
             xtal = pyxtal()
             xtal.from_seed(cif_file)
@@ -765,36 +788,28 @@ class builder(object):
                 xtal.substitute(substitute)
 
             xtal.resort_species(self.elements)
+            atoms = xtal.to_ase(resort=False)
 
-            ids = [0] * len(self.elements)
+            atom_index = None
             count = 0
-
             for site in xtal.atom_sites:
-                for i, element in enumerate(self.elements):
-                    if element == site.specie:
-                        ids[i] = count
-                        break
-
+                if site.specie == central_species:
+                    atom_index = count
+                    break
                 count += site.multiplicity
 
-            atoms = xtal.to_ase(resort=False)
-            refs = self.calculator.compute_p(
-                atoms,
-                ids,
-            )
-
-            if len(self.elements) != 1:
-                raise NotImplementedError(
-                    "The first target-coordination implementation currently "
-                    "supports an elemental system only."
+            if atom_index is None:
+                raise ValueError(
+                    f"Reference {cif_file} contains no {central_species} site."
                 )
 
+            refs = self.calculator.compute_p(atoms, [atom_index])
             ref = np.asarray(refs[0], dtype=float)
-            bank[target] = ref
+            bank[key] = ref
 
             if self.verbose:
                 print(
-                    f"Reference target CN={target}: "
+                    f"Reference {central_species} target CN={target}: "
                     f"{cif_file}, descriptor shape={ref.shape}"
                 )
 
@@ -854,13 +869,52 @@ class builder(object):
         g = xtal.group
         sites = [[] for _ in self.elements]
         dof = xtal.lattice.dof
+
+        # Normalize both sides to symbols. PyXtal site species may be species
+        # objects while ``self.elements`` contains strings.
+        element_symbols = [str(specie) for specie in self.elements]
+        matched_site_count = 0
+
         for s in xtal.atom_sites:
-            for i, specie in enumerate(self.elements):
-                if s.specie == specie:
-                    # wp_combo[i].append(s.wp)
+            site_symbol = str(s.specie)
+            matched = False
+
+            for i, element_symbol in enumerate(element_symbols):
+                if site_symbol == element_symbol:
                     sites[i].append(s.wp.get_label())
+                    matched = True
+                    matched_site_count += 1
                     break
+
+            if not matched:
+                raise ValueError(
+                    "Decoded atom site was not assigned to any builder element: "
+                    f"site species={s.specie!r}, normalized={site_symbol!r}, "
+                    f"builder elements={self.elements!r}, "
+                    f"normalized elements={element_symbols!r}."
+                )
+
             dof += s.wp.get_dof()
+
+        if matched_site_count != len(xtal.atom_sites):
+            raise ValueError(
+                "Species-to-builder mapping lost decoded atom sites: "
+                f"matched={matched_site_count}, "
+                f"decoded={len(xtal.atom_sites)}."
+            )
+
+        missing_elements = [
+            element_symbols[i]
+            for i, element_sites in enumerate(sites)
+            if len(element_sites) == 0
+        ]
+        if missing_elements:
+            raise ValueError(
+                "One or more required builder elements have no decoded "
+                "Wyckoff sites: "
+                f"missing={missing_elements}, sites={sites}, "
+                f"builder elements={self.elements!r}."
+            )
 
         return g.number, sites, dof
 
@@ -873,6 +927,7 @@ class builder(object):
             ref_environments = build_site_reference_matrix(
                 targets,
                 self.reference_environment_bank,
+                sites=xtal.atom_sites,
             )
         else:
             ref_environments = self.ref_environments
@@ -1779,4 +1834,5 @@ if __name__ == "__main__":
             xtals.append(xtal)
             bu.optimize_xtal(xtal)
         bu.optimize_xtals(xtals)
+
 
