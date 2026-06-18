@@ -8,9 +8,10 @@ species-specific SO3 environments for the pre-relaxation.
 """
 
 import argparse
+import json
 import os
 import shutil
-from collections import defaultdict
+from collections import Counter, defaultdict
 from functools import partial
 from multiprocessing import Pool
 from time import time
@@ -499,6 +500,138 @@ def save_pre_so3_database(decoded, output_path, source_csv):
     print(f"Saved {saved} pre-SO3 structures to {output_path}")
 
 
+
+def classify_decode_failure(message):
+    """Map a detailed exception message to a stable diagnostic category."""
+    value = str(message)
+    rules = [
+        ("invalid_space_group", ("Invalid space-group number",)),
+        ("padding_or_target_layout", (
+            "empty wp=-1 requires target 0",
+            "occupied site occurs after an empty slot",
+            "occupied site requires target 2 or 4",
+            "row contains no occupied sites",
+        )),
+        ("invalid_wyckoff_index", ("invalid Wyckoff", "wp index")),
+        ("generator_search_failed", ("search_generator",)),
+        ("species_lost", ("lost one species",)),
+        ("nonstoichiometric_multiplicity", (
+            "multiplicities do not satisfy SiO2",
+            "not stoichiometric SiO2",
+            "composition is not SiO2",
+        )),
+        ("site_count_changed", ("independent-site count does not match",)),
+        ("site_mapping_failed", (
+            "could not determine decoded Wyckoff index",
+            "no unused requested site matches",
+            "left requested sites unmatched",
+        )),
+        ("species_target_mismatch", (
+            "Unsupported decoded species",
+            "site requires target CN",
+        )),
+        ("lattice_failed", ("Lattice", "lattice")),
+        ("pyxtal_build_failed", (
+            "PyXtal returned an invalid or empty binary structure",
+            "invalid or empty binary structure",
+        )),
+    ]
+    for category, needles in rules:
+        if any(needle in value for needle in needles):
+            return category
+    return "other"
+
+
+def decoded_metadata_record(item):
+    """Return one pre-SO3 crystallographic metadata record."""
+    row_index, xtal, _rep, _targets, num_atoms, repair_info = item
+    si_wps = []
+    o_wps = []
+    for site in xtal.atom_sites:
+        label = site.wp.get_label()
+        symbol = str(site.specie)
+        if symbol == "Si":
+            si_wps.append(label)
+        elif symbol == "O":
+            o_wps.append(label)
+
+    composition = {
+        str(specie): int(count)
+        for specie, count in zip(xtal.species, xtal.numIons)
+    }
+    return {
+        "row_index": int(row_index),
+        "space_group": int(xtal.group.number),
+        "space_group_symbol": str(xtal.group.symbol),
+        "n_independent_si": len(si_wps),
+        "n_independent_o": len(o_wps),
+        "n_si": composition.get("Si", 0),
+        "n_o": composition.get("O", 0),
+        "num_atoms": int(num_atoms),
+        "si_wp_pattern": "|".join(si_wps),
+        "o_wp_pattern": "|".join(o_wps),
+        "cell_volume": float(xtal.lattice.volume),
+        "requested_site_count": int(repair_info["requested_site_count"]),
+        "decoded_site_count": int(repair_info["decoded_site_count"]),
+        "dropped_site_count": len(repair_info["dropped_slots"]),
+        "dropped_slots": "|".join(
+            str(value) for value in repair_info["dropped_slots"]
+        ),
+    }
+
+
+def attach_source_provenance(decoded):
+    """Attach source-row metadata to each PyXtal before SO3 optimization."""
+    for row_index, xtal, _rep, _targets, _num_atoms, repair_info in decoded:
+        tag = getattr(xtal, "tag", None)
+        if not isinstance(tag, dict):
+            tag = {}
+        tag.update({
+            "source_row": int(row_index),
+            "source_spg": int(xtal.group.number),
+            "source_requested_wps": list(repair_info["requested_wps"]),
+            "source_decoded_wps": list(repair_info["decoded_wps"]),
+        })
+        xtal.tag = tag
+
+
+def write_decode_diagnostics(output_dir, decoded, failures):
+    """Write detailed CSV diagnostics and return failure counts."""
+    failure_records = [
+        {
+            "row_index": int(row_index),
+            "category": classify_decode_failure(message),
+            "message": str(message),
+        }
+        for row_index, message in failures
+    ]
+    failure_df = pd.DataFrame(
+        failure_records,
+        columns=["row_index", "category", "message"],
+    )
+    failure_path = os.path.join(output_dir, "decode_failures.csv")
+    failure_df.to_csv(failure_path, index=False)
+
+    metadata_df = pd.DataFrame(
+        [decoded_metadata_record(item) for item in decoded]
+    )
+    metadata_path = os.path.join(output_dir, "pre_so3_metadata.csv")
+    metadata_df.to_csv(metadata_path, index=False)
+
+    counts = Counter(record["category"] for record in failure_records)
+    summary_rows = [
+        {"category": category, "count": int(count)}
+        for category, count in sorted(counts.items())
+    ]
+    pd.DataFrame(summary_rows, columns=["category", "count"]).to_csv(
+        os.path.join(output_dir, "decode_failure_summary.csv"),
+        index=False,
+    )
+    print(f"Decode diagnostics: {failure_path}")
+    print(f"Pre-SO3 metadata: {metadata_path}")
+    return dict(counts)
+
+
 def write_prototype_cif(name, output_path):
     """Write a PyXtal built-in prototype to CIF for the builder reference bank."""
     reference = pyxtal()
@@ -658,6 +791,7 @@ def main():
         n_decoded = n_optimized
         n_repaired = 0
         n_dropped_sites = 0
+        decode_failure_counts = {}
         optimization_time = 0.0
         print(f"Loaded optimized structures: {n_optimized}")
     else:
@@ -765,12 +899,20 @@ def main():
             f"{n_repaired}/{n_decoded}; dropped requested slots: {n_dropped_sites}"
         )
 
+        # Preserve the legacy plain-text failure log and additionally write
+        # structured CSV diagnostics for downstream analysis.
         if failures:
             failure_log = os.path.join(output_dir, "decode_failures.log")
             with open(failure_log, "w", encoding="utf-8") as handle:
                 for row_index, message in failures:
                     handle.write(f"row {row_index}: {message}\n")
             print(f"Decode failures: {len(failures)}; details: {failure_log}")
+
+        decode_failure_counts = write_decode_diagnostics(
+            output_dir,
+            decoded,
+            failures,
+        )
 
         if not decoded:
             raise RuntimeError("No sampled rows could be decoded by PyXtal.")
@@ -782,6 +924,7 @@ def main():
                 args.csv,
             )
 
+        attach_source_provenance(decoded)
         xtals = [item[1] for item in decoded]
 
         bu = builder(
@@ -971,9 +1114,37 @@ def main():
         handle.write(f"N_unique_xtal: {n_unique:12d}\n")
         handle.write(f"N_train_overlap: {n_overlap:12d}\n")
 
+    pipeline_summary = {
+        "source_csv": args.csv,
+        "resume_database": args.resume_db,
+        "input_rows": int(n_total),
+        "pyxtal_decoded": int(n_decoded),
+        "decode_failed": int(n_total - n_decoded),
+        "decode_failure_categories": decode_failure_counts,
+        "decoded_with_dropped_sites": int(n_repaired),
+        "dropped_requested_sites": int(n_dropped_sites),
+        "so3_survived": int(n_optimized),
+        "final_unique": int(n_unique),
+        "training_overlap": int(n_overlap),
+        "site_repair_policy": args.site_repair_policy,
+        "skip_topology": bool(args.skip_topology),
+        "skip_energy": bool(args.skip_energy),
+        "timing_minutes": {
+            "so3": optimization_time / 60.0,
+            "topology": topology_time / 60.0,
+            "energy": energy_time / 60.0,
+            "total": total_time / 60.0,
+        },
+    }
+    summary_path = os.path.join(output_dir, "pipeline_summary.json")
+    with open(summary_path, "w", encoding="utf-8") as handle:
+        json.dump(pipeline_summary, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+
     print(f"N0/N1/N2/N3: {n_total}/{n_decoded}/{n_optimized}/{n_unique}")
     print(f"Final database: {final_db}")
     print(f"Metrics: {metric_path}")
+    print(f"Pipeline summary: {summary_path}")
     print(f"Total wall time: {total_time / 60:.2f} minutes")
 
 
