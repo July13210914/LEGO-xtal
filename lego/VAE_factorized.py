@@ -16,14 +16,14 @@ import joblib
 import numpy as np
 import pandas as pd
 import torch
-from torch.nn import Linear, Module, Parameter, ReLU, Sequential
+from torch.nn import Linear, Module, ModuleList, Parameter, ReLU, Sequential
 from torch.nn.functional import cross_entropy
 from torch.optim import Adam
 from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
 from pyxtal.symmetry import Group
 
-# v9: calibrated first-shell cross-sublattice regularization.
+# v22: narrow/broad training-Gaussian mixture with smooth W reweighting and noisy R0 refinement.
 
 from .data_transformer import DataTransformer
 from .base import BaseSynthesizer, random_state
@@ -143,6 +143,55 @@ def _parse_wp_token(token):
         raise ValueError(f"Malformed Wyckoff token: {token!r}") from exc
 
 
+def _get_column_span(transformer, column_name):
+    """Return the transformed-space span for one original column."""
+    st = 0
+    for info in transformer._column_transform_info_list:
+        ed = st + info.output_dimensions
+        if info.column_name == column_name:
+            return st, ed
+        st = ed
+    raise KeyError(f"Column {column_name!r} not found in transformer.")
+
+
+def _masked_selected_reconstruction_loss(
+    recon_x,
+    x,
+    sigmas,
+    output_info,
+    factor,
+    include_span,
+    row_weight,
+):
+    """Selected-span reconstruction loss with one scalar weight per row."""
+    st = 0
+    per_row = torch.zeros(x.size(0), device=x.device, dtype=x.dtype)
+    used = False
+    for column_info in output_info:
+        for span_info in column_info:
+            ed = st + span_info.dim
+            if include_span(st, ed):
+                used = True
+                if span_info.activation_fn != "softmax":
+                    std = sigmas[st:ed]
+                    residual = x[:, st:ed] - torch.tanh(recon_x[:, st:ed])
+                    per_row = per_row + (
+                        (residual ** 2) / (2 * std ** 2)
+                    ).sum(dim=1)
+                    per_row = per_row + torch.log(std).sum()
+                else:
+                    per_row = per_row + torch.nn.functional.cross_entropy(
+                        recon_x[:, st:ed],
+                        torch.argmax(x[:, st:ed], dim=-1),
+                        reduction="none",
+                    )
+            st = ed
+    if not used:
+        return recon_x.sum() * 0.0
+    denom = row_weight.sum().clamp_min(1.0)
+    return (per_row * row_weight).sum() * factor / denom
+
+
 def _block_reconstruction_loss(recon_x, x, sigmas, output_info, factor):
     st = 0
     terms = []
@@ -212,7 +261,7 @@ def _selected_reconstruction_loss(
     return sum(terms) * factor / x.size(0)
 
 class FactorizedVAE(BaseSynthesizer):
-    """Shared encoder with a five-stage Wyckoff-parameterized crystallographic decoder."""
+    """Factorized VAE with chemistry-aware Si Wyckoff feasibility masking."""
 
     def __init__(
         self,
@@ -310,11 +359,17 @@ class FactorizedVAE(BaseSynthesizer):
         self.si_skeleton_context_encoder = MLP(
             si_dim, (self.context_dim,), self.context_dim
         ).to(self._device)
-        self.si_coordinate_decoder = ConditionalDecoder(
-            self.embedding_dim + 2 * self.context_dim,
-            self.decompress_dims,
-            si_dim,
-        ).to(self._device)
+        # One decoder per independent Si site. Each site sees the global
+        # crystallographic context, the complete Si Wyckoff skeleton, and the
+        # already established partial Si block.
+        self.si_coordinate_decoders = ModuleList([
+            ConditionalDecoder(
+                self.embedding_dim + 3 * self.context_dim,
+                self.decompress_dims,
+                si_dim,
+            )
+            for _ in range(self.n_si_sites)
+        ]).to(self._device)
         self.si_context_encoder = MLP(
             si_dim, (self.context_dim,), self.context_dim
         ).to(self._device)
@@ -340,7 +395,7 @@ class FactorizedVAE(BaseSynthesizer):
             self.global_context_encoder,
             self.si_skeleton_decoder,
             self.si_skeleton_context_encoder,
-            self.si_coordinate_decoder,
+            self.si_coordinate_decoders,
             self.si_context_encoder,
             self.o_skeleton_decoder,
             self.o_skeleton_context_encoder,
@@ -351,7 +406,7 @@ class FactorizedVAE(BaseSynthesizer):
         state = {name: getattr(self, name) for name in [
             "encoder", "global_decoder", "global_context_encoder",
             "si_skeleton_decoder", "si_skeleton_context_encoder",
-            "si_coordinate_decoder", "si_context_encoder",
+            "si_coordinate_decoders", "si_context_encoder",
             "o_skeleton_decoder", "o_skeleton_context_encoder",
             "o_coordinate_decoder", "global_transformer", "si_transformer",
             "o_transformer",
@@ -362,6 +417,9 @@ class FactorizedVAE(BaseSynthesizer):
                 "embedding_dim": self.embedding_dim,
                 "context_dim": self.context_dim,
                 "decoder_stages": 5,
+                "si_coordinate_mode": "sitewise_autoregressive",
+                "si_skeleton_conditioning": "training_gaussian_mixture_gate_plus_smooth_packing_bias",
+                "si_coordinate_conditioning": "best_packing_realization_from_selected_skeleton",
             },
         })
         joblib.dump(state, filepath)
@@ -411,6 +469,26 @@ class FactorizedVAE(BaseSynthesizer):
             self.o_transformer, "o_skeleton_token"
         )[:2]
 
+        _, _, si_categories = _get_discrete_span_and_categories(
+            self.si_transformer, "si_skeleton_token"
+        )
+        parsed_si_categories = [_parse_wp_token(token) for token in si_categories]
+        self.n_si_sites = max(len(token) for token in parsed_si_categories)
+        self.si_site_spans = [
+            tuple(
+                _get_column_span(self.si_transformer, f"si_{axis}{site}")
+                for axis in ("u0_", "u1_", "u2_")
+            )
+            for site in range(self.n_si_sites)
+        ]
+        active_lookup = np.zeros(
+            (len(parsed_si_categories), self.n_si_sites), dtype=np.float32
+        )
+        for category, token in enumerate(parsed_si_categories):
+            for site, wp in enumerate(token[:self.n_si_sites]):
+                active_lookup[category, site] = float(wp >= 0)
+        self.si_active_lookup = torch.from_numpy(active_lookup).to(self._device)
+
         self._build_models(global_x.shape[1], si_x.shape[1], o_x.shape[1])
         row_ids = torch.arange(len(global_x), device=self._device, dtype=torch.long)
         dataset = TensorDataset(
@@ -432,7 +510,8 @@ class FactorizedVAE(BaseSynthesizer):
             running = {
                 "global": 0.0, "si_skeleton": 0.0, "si_coordinates": 0.0,
                 "o_skeleton": 0.0, "o_coordinates": 0.0,
-                "cross": 0.0, "teacher_cross": 0.0, "kl": 0.0,
+                "cross": 0.0, "teacher_cross": 0.0,
+                "kl": 0.0,
             }
             count = 0
             predicted_probability = self._context_probability(epoch)
@@ -449,8 +528,17 @@ class FactorizedVAE(BaseSynthesizer):
 
                     global_raw, global_sigma = self.global_decoder(z)
                     global_pred = _activate_transformed(global_raw, self.global_transformer.output_info_list)
-                    global_for_context = self._mix_context(global_b, global_pred, predicted_probability)
+
+                    # The normal autoregressive pathway may gradually consume
+                    # predicted global context.
+                    global_for_context = self._mix_context(
+                        global_b, global_pred, predicted_probability
+                    )
                     global_context = self.global_context_encoder(global_for_context)
+
+                    # Stable teacher global context used specifically for
+                    # learning P(R_Si | G, W_Si).
+                    si_global_teacher_context = self.global_context_encoder(global_b)
 
                     si_skel_raw, si_skel_sigma = self.si_skeleton_decoder(
                         torch.cat([z, global_context], dim=1)
@@ -463,17 +551,82 @@ class FactorizedVAE(BaseSynthesizer):
                     si_true_skel[:, s0:s1] = si_b[:, s0:s1]
                     si_pred_skel = torch.zeros_like(si_b)
                     si_pred_skel[:, s0:s1] = si_skel_pred_full[:, s0:s1]
+                    # Normal mixed context is retained for downstream
+                    # autoregressive conditioning.
                     si_skel_for_context = self._mix_context(
                         si_true_skel, si_pred_skel, predicted_probability
                     )
-                    si_skel_context = self.si_skeleton_context_encoder(si_skel_for_context)
+                    si_skel_context = self.si_skeleton_context_encoder(
+                        si_skel_for_context
+                    )
 
-                    si_coord_raw, si_coord_sigma = self.si_coordinate_decoder(
-                        torch.cat([z, global_context, si_skel_context], dim=1)
+                    # Site-wise Si coordinate generation:
+                    # P(R_i | G_teacher, W_Si,teacher, R_<i).
+                    si_teacher_skel_context = self.si_skeleton_context_encoder(
+                        si_true_skel
                     )
-                    si_coord_pred = _activate_transformed(
-                        si_coord_raw, self.si_transformer.output_info_list
+                    teacher_category = torch.argmax(
+                        si_b[:, s0:s1], dim=1
                     )
+                    si_active = self.si_active_lookup[teacher_category]
+
+                    # Start from the teacher skeleton only. At each step, the
+                    # already established teacher coordinates are exposed to
+                    # the next site decoder (teacher forcing).
+                    si_partial_teacher = si_true_skel.clone()
+                    si_coord_pred = torch.zeros_like(si_b)
+                    si_coordinate_loss = si_b.sum() * 0.0
+                    si_coord_raw_for_geometry = torch.zeros_like(si_b)
+
+                    for site, decoder in enumerate(self.si_coordinate_decoders):
+                        partial_context = self.si_context_encoder(
+                            si_partial_teacher
+                        )
+                        site_raw, site_sigma = decoder(
+                            torch.cat(
+                                [
+                                    z,
+                                    si_global_teacher_context,
+                                    si_teacher_skel_context,
+                                    partial_context,
+                                ],
+                                dim=1,
+                            )
+                        )
+                        site_pred_full = _activate_transformed(
+                            site_raw, self.si_transformer.output_info_list
+                        )
+                        site_spans = self.si_site_spans[site]
+                        for st_site, ed_site in site_spans:
+                            si_coord_pred[:, st_site:ed_site] = (
+                                site_pred_full[:, st_site:ed_site]
+                            )
+                            si_coord_raw_for_geometry[:, st_site:ed_site] = (
+                                site_raw[:, st_site:ed_site]
+                            )
+
+                        include = lambda st, ed, spans=site_spans: (
+                            (st, ed) in spans
+                        )
+                        si_coordinate_loss = si_coordinate_loss + (
+                            _masked_selected_reconstruction_loss(
+                                site_raw,
+                                si_b,
+                                site_sigma,
+                                self.si_transformer.output_info_list,
+                                self.loss_factor,
+                                include,
+                                si_active[:, site],
+                            )
+                        )
+
+                        # Teacher-force this site's true coordinates into the
+                        # partial Si block for the next conditional step.
+                        for st_site, ed_site in site_spans:
+                            si_partial_teacher[:, st_site:ed_site] = (
+                                si_b[:, st_site:ed_site]
+                            )
+
                     si_pred = _merge_skeleton_and_coordinates(
                         si_skel_pred_full, si_coord_pred, self.si_skeleton_span
                     )
@@ -509,11 +662,6 @@ class FactorizedVAE(BaseSynthesizer):
                         self.si_transformer.output_info_list, self.loss_factor,
                         lambda st, ed: st == s0 and ed == s1,
                     )
-                    si_coordinate_loss = _selected_reconstruction_loss(
-                        si_coord_raw, si_b, si_coord_sigma,
-                        self.si_transformer.output_info_list, self.loss_factor,
-                        lambda st, ed: not (st == s0 and ed == s1),
-                    )
                     o_skeleton_loss = _selected_reconstruction_loss(
                         o_skel_raw, o_b, o_skel_sigma,
                         self.o_transformer.output_info_list, self.loss_factor,
@@ -528,20 +676,17 @@ class FactorizedVAE(BaseSynthesizer):
                         1 + logvar - mu.pow(2) - logvar.exp()
                     ) / full_b.size(0)
 
-                    # Cross-sublattice regularizer. geometry_data contains a
-                    # differentiable callable prepared by the training script.
-                    # It evaluates soft Si->O4 and O->Si2 coordination from
-                    # symmetry-expanded positions reconstructed from the
-                    # predicted Wyckoff free parameters. Only a small subset of
-                    # each minibatch is used to control training cost.
-                    cross_loss = o_coord_raw.sum() * 0.0
-                    teacher_cross_loss = o_coord_raw.sum() * 0.0
+                    # Optional cross-sublattice coordination regularizer.
+                    cross_loss = si_coord_raw_for_geometry.sum() * 0.0
+                    teacher_cross_loss = si_coord_raw_for_geometry.sum() * 0.0
                     if self.cross_loss_weight > 0 and self._geometry_data is not None:
                         n_cross = min(self.cross_batch_size, full_b.size(0))
                         cross_loss, teacher_cross_loss = self._geometry_data(
                             row_id_b[:n_cross],
-                            si_coord_raw[:n_cross],
+                            global_raw[:n_cross],
+                            si_coord_raw_for_geometry[:n_cross],
                             o_coord_raw[:n_cross],
+                            self.global_transformer,
                             self.si_transformer,
                             self.o_transformer,
                             self.cross_onset,
@@ -565,8 +710,8 @@ class FactorizedVAE(BaseSynthesizer):
                 scaler.update()
                 for decoder in [
                     self.global_decoder, self.si_skeleton_decoder,
-                    self.si_coordinate_decoder, self.o_skeleton_decoder,
-                    self.o_coordinate_decoder,
+                    *list(self.si_coordinate_decoders),
+                    self.o_skeleton_decoder, self.o_coordinate_decoder,
                 ]:
                     decoder.sigma.data.clamp_(0.01, 1.0)
 
@@ -600,9 +745,10 @@ class FactorizedVAE(BaseSynthesizer):
                 + self.cross_loss_weight * record["cross_loss"]
             )
             iterator.set_description(
-                f"Loss {total_display:.3f} | cross {record['cross_loss']:.3f} "
-                f"| teacher {record['teacher_cross_loss']:.3f} "
-                f"(w={self.cross_loss_weight:g}) | ctx {predicted_probability:.2f}"
+                f"Loss {total_display:.3f} | coord {record['cross_loss']:.3f} "
+                f"(w={self.cross_loss_weight:g}) | "
+                f"Si sitewise R_i|G,W,R_<i | "
+                f"ctx {predicted_probability:.2f}"
             )
             if (epoch + 1) % 25 == 0:
                 self.save(os.path.join(
@@ -621,6 +767,18 @@ class FactorizedVAE(BaseSynthesizer):
         sigma[st:ed] = skeleton_decoder.sigma.detach()[st:ed]
         return sigma.cpu().numpy()
 
+    def _combined_si_sigma(self, skeleton_span):
+        sigma = torch.ones(
+            self.si_transformer.output_dimensions,
+            device=self._device,
+        ) * 0.1
+        for site, decoder in enumerate(self.si_coordinate_decoders):
+            for st, ed in self.si_site_spans[site]:
+                sigma[st:ed] = decoder.sigma.detach()[st:ed]
+        st, ed = skeleton_span
+        sigma[st:ed] = self.si_skeleton_decoder.sigma.detach()[st:ed]
+        return sigma.cpu().numpy()
+
     @random_state
     def sample(
         self,
@@ -629,8 +787,10 @@ class FactorizedVAE(BaseSynthesizer):
         hard=True,
         enforce_sio2_multiplicity=True,
         max_independent_sites=None,
+        si_skeleton_feasibility=None,
+        si_feasibility_topk=16,
     ):
-        """Five-stage sampling with explicit skeleton-conditioned coordinates."""
+        """Sample G, mask Si skeletons by stoichiometry and packing feasibility, then generate coordinates."""
         for module in self._all_modules():
             module.eval()
 
@@ -656,10 +816,12 @@ class FactorizedVAE(BaseSynthesizer):
             if max_independent_sites <= 0:
                 raise ValueError("max_independent_sites must be positive or None.")
 
-        global_batches, si_batches, o_batches, valid_batches = [], [], [], []
+        global_batches, global_realized_batches, si_batches, o_batches, valid_batches = [], [], [], [], []
         stats = {
             "rows": 0, "invalid_space_group": 0,
             "no_compatible_si_skeleton": 0, "invalid_si_skeleton": 0,
+            "no_packing_feasible_si_skeleton": 0,
+            "packing_conditioned_si_coordinates": 0,
             "no_compatible_o_skeleton": 0,
         }
         generated = 0
@@ -674,6 +836,16 @@ class FactorizedVAE(BaseSynthesizer):
                     temperature=temperature, hard=hard,
                 )
                 global_context = self.global_context_encoder(global_x)
+
+                # Realize the decoder Gaussian randomizer exactly once.  This
+                # noisy cell is used both by the Si chemistry condition and by
+                # the final output, preserving G diversity without a mismatch.
+                global_batch_df = self.global_transformer.inverse_transform(
+                    global_x.detach().cpu().numpy(),
+                    self.global_decoder.sigma.detach().cpu().numpy(),
+                )
+                global_realized_batches.append(global_batch_df.copy())
+
                 row_valid = torch.ones(current_batch, dtype=torch.bool, device=self._device)
                 spg_ids = torch.argmax(global_x[:, spg_st:spg_ed], dim=1).cpu().tolist()
                 row_multiplicities = [None] * current_batch
@@ -733,6 +905,76 @@ class FactorizedVAE(BaseSynthesizer):
                             stats["no_compatible_si_skeleton"] += 1
                             si_allowed[row, 0] = True
                     si_masks = {(si_st, si_ed): si_allowed}
+
+                feasibility_best_free = None
+                feasibility_best_score = None
+                feasibility_logit_bias = None
+
+                # Chemistry-aware feasibility filter:
+                # keep only Si skeletons that can realize a broad nearest-neighbor
+                # window inside the sampled cell after a short search over free
+                # Wyckoff parameters.
+                if si_skeleton_feasibility is not None:
+                    if si_masks is None:
+                        current_allowed = torch.ones(
+                            current_batch,
+                            len(si_categories),
+                            dtype=torch.bool,
+                            device=self._device,
+                        )
+                    else:
+                        current_allowed = si_masks[(si_st, si_ed)].clone()
+
+                    feasibility_result = si_skeleton_feasibility(
+                        global_batch_df,
+                        parsed_si,
+                        current_allowed.detach().cpu().numpy(),
+                        si_skel_raw[:, si_st:si_ed].detach().cpu().numpy(),
+                        int(si_feasibility_topk),
+                    )
+                    if isinstance(feasibility_result, dict):
+                        feasibility_allowed_np = feasibility_result["allowed"]
+                        feasibility_best_free = feasibility_result.get("best_free")
+                        feasibility_best_score = feasibility_result.get("best_score")
+                        feasibility_logit_bias = feasibility_result.get("logit_bias")
+                    else:
+                        # Backward-compatible mask-only callback.
+                        feasibility_allowed_np = feasibility_result
+                        feasibility_best_free = None
+                        feasibility_best_score = None
+                        feasibility_logit_bias = None
+                    feasibility_allowed = torch.as_tensor(
+                        feasibility_allowed_np,
+                        device=self._device,
+                        dtype=torch.bool,
+                    )
+                    combined_allowed = current_allowed & feasibility_allowed
+
+                    for row in range(current_batch):
+                        if bool(row_valid[row]) and not bool(combined_allowed[row].any()):
+                            row_valid[row] = False
+                            stats["no_packing_feasible_si_skeleton"] += 1
+                            # Keep one fallback category only to keep tensor sampling valid.
+                            fallback = torch.argmax(
+                                si_skel_raw[row, si_st:si_ed]
+                            )
+                            combined_allowed[row, fallback] = True
+
+                    si_masks = {(si_st, si_ed): combined_allowed}
+
+                    # Smooth chemistry conditioning: among candidates that pass
+                    # the single stochastic Gaussian gate, retain decoder
+                    # diversity but reweight logits by their packing energy.
+                    if feasibility_logit_bias is not None:
+                        bias = torch.as_tensor(
+                            feasibility_logit_bias,
+                            device=self._device,
+                            dtype=si_skel_raw.dtype,
+                        )
+                        si_skel_raw[:, si_st:si_ed] = (
+                            si_skel_raw[:, si_st:si_ed] + bias
+                        )
+
                 si_skel_full = _activate_transformed(
                     si_skel_raw, self.si_transformer.output_info_list,
                     temperature=temperature, hard=hard,
@@ -742,14 +984,89 @@ class FactorizedVAE(BaseSynthesizer):
                 si_skel_only[:, si_st:si_ed] = si_skel_full[:, si_st:si_ed]
                 si_skel_context = self.si_skeleton_context_encoder(si_skel_only)
 
-                # Stage 3: Si coordinates conditioned on the sampled Si skeleton.
-                si_coord_raw, _ = self.si_coordinate_decoder(
-                    torch.cat([z, global_context, si_skel_context], dim=1)
-                )
-                si_coord_x = _activate_transformed(
-                    si_coord_raw, self.si_transformer.output_info_list,
-                    temperature=temperature, hard=hard,
-                )
+                # Stage 3: site-wise Si coordinates conditioned on sampled
+                # G, sampled W_Si, and previously generated Si sites.
+                si_partial = si_skel_only.clone()
+                si_coord_x = torch.zeros_like(si_skel_full)
+                for site, decoder in enumerate(self.si_coordinate_decoders):
+                    partial_context = self.si_context_encoder(si_partial)
+                    site_raw, _ = decoder(
+                        torch.cat(
+                            [z, global_context, si_skel_context, partial_context],
+                            dim=1,
+                        )
+                    )
+                    site_x = _activate_transformed(
+                        site_raw,
+                        self.si_transformer.output_info_list,
+                        temperature=temperature,
+                        hard=hard,
+                    )
+                    for st_site, ed_site in self.si_site_spans[site]:
+                        si_coord_x[:, st_site:ed_site] = (
+                            site_x[:, st_site:ed_site]
+                        )
+                        si_partial[:, st_site:ed_site] = (
+                            site_x[:, st_site:ed_site]
+                        )
+                # v20: realize the gradient-optimized chemistry-feasible R0 found while
+                # selecting W0.  v18 discarded these coordinates and sampled an
+                # unrelated R0, so feasibility of (G,W0) did not guarantee the
+                # final Si sublattice.  Transform the selected free parameters
+                # through the fitted Si transformer and overwrite only the
+                # continuous coordinate spans.
+                if feasibility_best_free is not None:
+                    selected_si_ids = torch.argmax(
+                        si_skel_full[:, si_st:si_ed], dim=1
+                    ).detach().cpu().numpy()
+                    override_records = []
+                    use_override = np.zeros(current_batch, dtype=bool)
+                    for row in range(current_batch):
+                        category = int(selected_si_ids[row])
+                        token = parsed_si[category]
+                        record = {
+                            "si_skeleton_token": si_categories[category]
+                        }
+                        free_values = feasibility_best_free[row, category]
+                        for site in range(self.n_si_sites):
+                            active = site < len(token) and int(token[site]) >= 0
+                            if active and np.all(np.isfinite(free_values[site])):
+                                values = free_values[site]
+                                use_override[row] = True
+                            else:
+                                values = np.asarray(
+                                    [-1.0, -1.0, -1.0] if not active
+                                    else [0.0, 0.0, 0.0],
+                                    dtype=float,
+                                )
+                            for axis in range(3):
+                                record[f"si_u{axis}_{site}"] = float(values[axis])
+                        override_records.append(record)
+
+                    if bool(use_override.any()):
+                        override_df = pd.DataFrame(override_records)
+                        override_np = self.si_transformer.transform(
+                            override_df
+                        ).astype("float32")
+                        override_x = torch.as_tensor(
+                            override_np,
+                            device=self._device,
+                            dtype=si_coord_x.dtype,
+                        )
+                        override_mask = torch.as_tensor(
+                            use_override,
+                            device=self._device,
+                            dtype=torch.bool,
+                        )
+                        stats["packing_conditioned_si_coordinates"] += int(
+                            use_override.sum()
+                        )
+                        for site in range(self.n_si_sites):
+                            for st_site, ed_site in self.si_site_spans[site]:
+                                si_coord_x[override_mask, st_site:ed_site] = (
+                                    override_x[override_mask, st_site:ed_site]
+                                )
+
                 si_x = _merge_skeleton_and_coordinates(
                     si_skel_full, si_coord_x, (si_st, si_ed)
                 )
@@ -825,15 +1142,23 @@ class FactorizedVAE(BaseSynthesizer):
         valid_mask = np.concatenate(valid_batches, axis=0)[:samples]
         stats["rows"] = int(samples)
 
-        global_df = self.global_transformer.inverse_transform(
-            global_array, self.global_decoder.sigma.detach().cpu().numpy()
-        )
+        # Use the exact noisy G realization already seen by the Si chemistry
+        # conditioner.  No second inverse-transform draw is performed.
+        global_df = pd.concat(
+            global_realized_batches, ignore_index=True
+        ).iloc[:samples].reset_index(drop=True)
+        # The chemistry conditioner already returns a Gaussian-randomized,
+        # smoothly refined R0.  Preserve it exactly during inverse transform;
+        # adding a second independent perturbation would alter the conditioned
+        # distribution.
+        si_inverse_sigma = self._combined_si_sigma((si_st, si_ed)).copy()
+        for site in range(self.n_si_sites):
+            for st_site, ed_site in self.si_site_spans[site]:
+                si_inverse_sigma[st_site:ed_site] = 0.0
+
         si_df = self.si_transformer.inverse_transform(
             si_array,
-            self._combined_sigma(
-                self.si_skeleton_decoder, self.si_coordinate_decoder,
-                (si_st, si_ed),
-            ),
+            si_inverse_sigma,
         )
         o_df = self.o_transformer.inverse_transform(
             o_array,

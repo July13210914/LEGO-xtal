@@ -5,7 +5,7 @@ This version canonicalizes independent sites as Si(CN4) -> O(CN2) -> padding,
 then trains a five-stage decoder:
     global:       space group and cell
     Si skeleton:  Si Wyckoff occupancy pattern
-    Si parameters: free Wyckoff parameters conditioned on sampled Si skeleton
+    Si parameters: site-wise free parameters conditioned on G, Si skeleton, and prior Si sites
     O skeleton:   O Wyckoff occupancy conditioned on the complete Si block
     O parameters: free Wyckoff parameters conditioned on sampled O skeleton
 
@@ -307,17 +307,20 @@ def restore_dtypes(df, training_df, num_wps, discrete_cell, discrete_coordinates
 
 
 
-class SoftCoordinationGeometry:
-    """Differentiable first-shell Si/O coordination loss.
+class CrystallographicChemistryGeometry:
+    """Differentiable local crystallographic-chemistry constraints.
 
-    The discrete space group and Wyckoff skeleton are teacher-forced from the
-    training row. Predicted free parameters are converted back from the RDT
-    normalized representation, mapped through cached affine Wyckoff operations,
-    and expanded to all symmetry-equivalent atoms. No bond angles or second
-    shells are used.
+    Space group and Wyckoff skeleton are teacher-forced only to expand predicted
+    free parameters for the optional cross-sublattice coordination diagnostic.
+    No Si-Si RDF objective is used in v15.
     """
 
-    def __init__(self, canonical_df, n_si_max, n_o_max):
+    def __init__(
+        self,
+        canonical_df,
+        n_si_max,
+        n_o_max,
+    ):
         self.rows = []
         self.n_si_max = int(n_si_max)
         self.n_o_max = int(n_o_max)
@@ -356,6 +359,7 @@ class SoftCoordinationGeometry:
             teacher_si = np.concatenate(teacher_si, axis=0)
             teacher_o = np.concatenate(teacher_o, axis=0)
             self.rows.append((spg, si_wps, o_wps, cell, teacher_si, teacher_o))
+
         self._template_cache = {}
 
     @staticmethod
@@ -371,6 +375,33 @@ class SoftCoordinationGeometry:
             [b*cg, b*sg, 0.0],
             [c*cb, c*(ca-cb*cg)/sg, c*np.sqrt(volume_term)/sg],
         ], dtype=np.float32)
+
+    @staticmethod
+    def _torch_cell_matrix(parameters):
+        """Construct a differentiable cell matrix from [a,b,c,alpha,beta,gamma]."""
+        a, b, c, alpha, beta, gamma = parameters.unbind(dim=-1)
+        # Keep sampled lengths positive without flattening useful gradients.
+        a = a.clamp_min(0.25)
+        b = b.clamp_min(0.25)
+        c = c.clamp_min(0.25)
+        ca, cb, cg = torch.cos(alpha), torch.cos(beta), torch.cos(gamma)
+        sg = torch.sin(gamma)
+        sg_safe = torch.where(
+            sg.abs() < 1e-4,
+            torch.where(sg >= 0, torch.full_like(sg, 1e-4), torch.full_like(sg, -1e-4)),
+            sg,
+        )
+        volume_term = 1 + 2 * ca * cb * cg - ca.square() - cb.square() - cg.square()
+        volume_term = volume_term.clamp_min(1e-8)
+        zeros = torch.zeros_like(a)
+        row0 = torch.stack([a, zeros, zeros], dim=-1)
+        row1 = torch.stack([b * cg, b * sg_safe, zeros], dim=-1)
+        row2 = torch.stack([
+            c * cb,
+            c * (ca - cb * cg) / sg_safe,
+            c * torch.sqrt(volume_term) / sg_safe,
+        ], dim=-1)
+        return torch.stack([row0, row1, row2], dim=-2)
 
     @staticmethod
     def _op_parts(op):
@@ -445,6 +476,25 @@ class SoftCoordinationGeometry:
             values.append(torch.stack(slot, dim=1))
         return torch.stack(values, dim=1)
 
+    def _raw_continuous_columns(self, logits, transformer, column_names):
+        """Differentiably invert selected continuous RDT columns."""
+        layout = self._continuous_layout(transformer)
+        values = []
+        for name in column_names:
+            if name not in layout:
+                raise ValueError(
+                    f"Crystallographic-chemistry loss requires continuous column {name!r}."
+                )
+            st, ed, gm = layout[name]
+            norm = torch.tanh(logits[:, st])
+            probs = torch.softmax(logits[:, st + 1:ed], dim=-1)
+            means, stds = self._gm_parameters(gm)
+            means = torch.as_tensor(means, device=logits.device, dtype=logits.dtype)
+            stds = torch.as_tensor(stds, device=logits.device, dtype=logits.dtype)
+            raw_components = norm[:, None] * (4.0 * stds[None, :]) + means[None, :]
+            values.append((probs * raw_components).sum(dim=1))
+        return torch.stack(values, dim=1)
+
     @staticmethod
     def _soft_cn(dist, onset, cutoff):
         """Unit bond count through onset, cosine taper to zero at cutoff."""
@@ -472,8 +522,16 @@ class SoftCoordinationGeometry:
         cn_o = weights.sum(dim=0)
         return ((cn_si - 4.0) ** 2).mean() + ((cn_o - 2.0) ** 2).mean()
 
-    def __call__(self, row_ids, si_logits, o_logits, si_transformer, o_transformer,
+
+    def __call__(self, row_ids, global_logits, si_logits, o_logits,
+                 global_transformer, si_transformer, o_transformer,
                  onset, cutoff, device):
+        cell_parameters = self._raw_continuous_columns(
+            global_logits,
+            global_transformer,
+            ["a", "b", "c", "alpha", "beta", "gamma"],
+        )
+        predicted_cells = self._torch_cell_matrix(cell_parameters)
         si_u = self._raw_parameters(si_logits, si_transformer, "si", self.n_si_max)
         o_u = self._raw_parameters(o_logits, o_transformer, "o", self.n_o_max)
         losses = []
@@ -495,8 +553,11 @@ class SoftCoordinationGeometry:
                 continue
             sf = torch.cat(si_pos, dim=0)
             of = torch.cat(o_pos, dim=0)
-            cell = torch.as_tensor(cell_np, device=device, dtype=sf.dtype)
-            losses.append(self._coordination_penalty(sf, of, cell, onset, cutoff))
+            teacher_cell = torch.as_tensor(cell_np, device=device, dtype=sf.dtype)
+            pred_cell = predicted_cells[local].to(dtype=sf.dtype)
+            losses.append(
+                self._coordination_penalty(sf, of, pred_cell, onset, cutoff)
+            )
 
             teacher_si = torch.as_tensor(
                 teacher_si_np, device=device, dtype=sf.dtype
@@ -506,13 +567,548 @@ class SoftCoordinationGeometry:
             )
             teacher_losses.append(
                 self._coordination_penalty(
-                    teacher_si, teacher_o, cell, onset, cutoff
+                    teacher_si, teacher_o, teacher_cell, onset, cutoff
                 )
             )
         if not losses:
             zero = si_logits.sum() * 0.0
             return zero, zero
-        return torch.stack(losses).mean(), torch.stack(teacher_losses).mean()
+        return (
+            torch.stack(losses).mean(),
+            torch.stack(teacher_losses).mean(),
+        )
+
+
+
+def _cell_matrix_numpy(row):
+    a, b, c = float(row["a"]), float(row["b"]), float(row["c"])
+    alpha, beta, gamma = (
+        float(row["alpha"]), float(row["beta"]), float(row["gamma"])
+    )
+    ca, cb, cg = np.cos(alpha), np.cos(beta), np.cos(gamma)
+    sg = np.sin(gamma)
+    if abs(sg) < 1.0e-10:
+        raise ValueError("Degenerate gamma angle.")
+    y3 = c * (ca - cb * cg) / sg
+    z3_sq = c * c - (c * cb) ** 2 - y3 ** 2
+    if z3_sq <= 1.0e-10:
+        raise ValueError("Degenerate cell metric.")
+    return np.asarray(
+        [
+            [a, 0.0, 0.0],
+            [b * cg, b * sg, 0.0],
+            [c * cb, y3, np.sqrt(z3_sq)],
+        ],
+        dtype=np.float32,
+    )
+
+
+def _periodic_nearest_numpy(frac, cell, shift_range=2):
+    shifts = np.asarray(
+        [
+            [i, j, k]
+            for i in range(-shift_range, shift_range + 1)
+            for j in range(-shift_range, shift_range + 1)
+            for k in range(-shift_range, shift_range + 1)
+        ],
+        dtype=float,
+    )
+    delta = frac[:, None, None, :] - frac[None, :, None, :]
+    delta = delta + shifts[None, None, :, :]
+    cart = np.einsum("...i,ij->...j", delta, cell)
+    distances = np.linalg.norm(cart, axis=-1)
+    zero_shift = np.where(np.all(shifts == 0, axis=1))[0][0]
+    ids = np.arange(len(frac))
+    distances[ids, ids, zero_shift] = np.inf
+    return distances.reshape(len(frac), -1).min(axis=1)
+
+
+def estimate_training_si_nn_gaussian(
+    canonical_df,
+    num_wps,
+    histogram_bin=0.05,
+    fit_window=0.75,
+    sigma_floor=0.20,
+    shift_range=2,
+):
+    """Fit a Gaussian to the first Si-Si nearest-neighbor peak."""
+    nearest_all = []
+
+    for _, row in canonical_df.iterrows():
+        try:
+            spg = int(row["spg"])
+            group = Group(spg)
+            cell = _cell_matrix_numpy(row)
+            positions = []
+            for slot in range(num_wps):
+                if int(row[f"target_coord{slot}"]) != 4:
+                    continue
+                wp_index = int(row[f"wp{slot}"])
+                if wp_index < 0 or wp_index >= len(group):
+                    continue
+                generator = np.asarray(
+                    [row[f"x{slot}"], row[f"y{slot}"], row[f"z{slot}"]],
+                    dtype=float,
+                )
+                wp = group[wp_index]
+                positions.extend(
+                    np.asarray([op.operate(generator) for op in wp.ops], dtype=float)
+                    % 1.0
+                )
+            if len(positions) < 2:
+                continue
+            frac = np.asarray(positions, dtype=float)
+            nearest = _periodic_nearest_numpy(
+                frac, cell, shift_range=shift_range
+            )
+            nearest_all.extend(
+                nearest[np.isfinite(nearest) & (nearest > 0.0)].tolist()
+            )
+        except Exception:
+            continue
+
+    values = np.asarray(nearest_all, dtype=float)
+    if values.size < 10:
+        raise ValueError(
+            "Could not collect enough training Si nearest-neighbor distances."
+        )
+
+    lo, hi = float(values.min()), float(values.max())
+    bins = np.arange(lo, hi + histogram_bin, histogram_bin)
+    if bins.size < 3:
+        bins = np.linspace(lo, hi + 1.0e-6, 4)
+    counts, edges = np.histogram(values, bins=bins)
+    peak_bin = int(np.argmax(counts))
+    peak_center = 0.5 * (edges[peak_bin] + edges[peak_bin + 1])
+
+    peak_values = values[np.abs(values - peak_center) <= fit_window]
+    if peak_values.size < 10:
+        peak_values = values
+
+    mu = float(np.mean(peak_values))
+    sigma = max(float(np.std(peak_values, ddof=1)), float(sigma_floor))
+
+    return {
+        "mu": mu,
+        "sigma": sigma,
+        "peak_center": float(peak_center),
+        "n_all": int(values.size),
+        "n_peak": int(peak_values.size),
+        "q05": float(np.quantile(values, 0.05)),
+        "q50": float(np.quantile(values, 0.50)),
+        "q95": float(np.quantile(values, 0.95)),
+    }
+
+
+class SiGaussianPackingConditioner:
+    """One narrow/broad Gaussian-mixture gate followed by smooth R0 refinement.
+
+    The gate acts only before optimization.  It compares the initial structure
+    dmin with the Gaussian fitted to the first training Si-Si nearest-neighbor
+    peak.  Surviving candidates are smoothly reweighted and refined; there is no
+    second hard acceptance cutoff after optimization.
+    """
+
+    def __init__(
+        self,
+        nn_mu,
+        nn_sigma,
+        restarts=4,
+        optimize_steps=12,
+        optimize_lr=0.03,
+        trust_radius=0.10,
+        gate_density_min=0.005,
+        gate_density_max=0.05,
+        broad_fraction=0.05,
+        broad_sigma_scale=3.0,
+        logit_beta=1.0,
+        final_noise_std=0.01,
+        shift_range=2,
+        seed=42,
+        device="cpu",
+        progress_every=25,
+    ):
+        if nn_sigma <= 0:
+            raise ValueError("nn_sigma must be positive.")
+        if restarts < 1 or optimize_steps < 0:
+            raise ValueError("restarts must be positive and optimize_steps nonnegative.")
+        if optimize_lr <= 0 or trust_radius < 0:
+            raise ValueError("optimize_lr must be positive and trust_radius nonnegative.")
+        if not 0 < gate_density_min <= gate_density_max <= 1:
+            raise ValueError("Gate density fractions must satisfy 0 < min <= max <= 1.")
+        if not 0 <= broad_fraction <= 1:
+            raise ValueError("broad_fraction must lie in [0,1].")
+        if broad_sigma_scale < 1.0:
+            raise ValueError("broad_sigma_scale must be at least 1.")
+        if logit_beta < 0 or final_noise_std < 0:
+            raise ValueError("logit_beta and final_noise_std must be nonnegative.")
+
+        self.nn_mu = float(nn_mu)
+        self.nn_sigma = float(nn_sigma)
+        self.restarts = int(restarts)
+        self.optimize_steps = int(optimize_steps)
+        self.optimize_lr = float(optimize_lr)
+        self.trust_radius = float(trust_radius)
+        self.gate_density_min = float(gate_density_min)
+        self.gate_density_max = float(gate_density_max)
+        self.broad_fraction = float(broad_fraction)
+        self.broad_sigma_scale = float(broad_sigma_scale)
+        self.logit_beta = float(logit_beta)
+        self.final_noise_std = float(final_noise_std)
+        self.shift_range = int(shift_range)
+        self.rng = np.random.default_rng(seed)
+        self.device = torch.device(device)
+        self.progress_every = int(progress_every)
+        self._group_cache = {}
+        self._template_cache = {}
+
+    def _group(self, spg):
+        spg = int(spg)
+        if spg not in self._group_cache:
+            self._group_cache[spg] = Group(spg)
+        return self._group_cache[spg]
+
+    @staticmethod
+    def _op_parts(op):
+        rot = getattr(op, "rotation_matrix", None)
+        trans = getattr(op, "translation_vector", None)
+        if rot is None or trans is None:
+            affine = np.asarray(op.affine_matrix, dtype=float)
+            rot, trans = affine[:3, :3], affine[:3, 3]
+        return np.asarray(rot, dtype=float), np.asarray(trans, dtype=float)
+
+    def _site_template(self, spg, wp_index):
+        key = (int(spg), int(wp_index))
+        if key in self._template_cache:
+            return self._template_cache[key]
+
+        wp = self._group(spg)[int(wp_index)]
+        dof = int(wp.get_dof())
+        if dof == 0:
+            u0 = np.zeros(0, dtype=float)
+            base = np.asarray(wp.get_position_from_free_xyzs(u0), dtype=float)
+            jacobian = np.zeros((3, 3), dtype=float)
+        else:
+            u0 = np.full(dof, 0.271, dtype=float)
+            base = np.asarray(wp.get_position_from_free_xyzs(u0), dtype=float)
+            jacobian = np.zeros((3, 3), dtype=float)
+            eps = 1.0e-5
+            for axis in range(dof):
+                shifted_u = u0.copy()
+                shifted_u[axis] += eps
+                shifted = np.asarray(
+                    wp.get_position_from_free_xyzs(shifted_u), dtype=float
+                )
+                delta = shifted - base
+                delta -= np.round(delta)
+                jacobian[:, axis] = delta / eps
+
+        intercept = base - jacobian[:, :dof] @ u0
+        matrices, offsets = [], []
+        for op in wp.ops:
+            rotation, translation = self._op_parts(op)
+            matrices.append(rotation @ jacobian)
+            offsets.append(rotation @ intercept + translation)
+
+        result = (
+            torch.as_tensor(np.asarray(matrices, dtype=np.float32), device=self.device),
+            torch.as_tensor(np.asarray(offsets, dtype=np.float32), device=self.device),
+            dof,
+        )
+        self._template_cache[key] = result
+        return result
+
+    def _expanded_positions(self, spg, wp_indices, parameters):
+        positions = []
+        for site_index, wp_index in enumerate(wp_indices):
+            matrices, offsets, _ = self._site_template(spg, wp_index)
+            positions.append(
+                torch.einsum("aij,j->ai", matrices, parameters[site_index])
+                + offsets
+            )
+        return torch.cat(positions, dim=0)
+
+    def _nearest_distances(self, frac, cell):
+        r = self.shift_range
+        shifts = torch.tensor(
+            [
+                [i, j, k]
+                for i in range(-r, r + 1)
+                for j in range(-r, r + 1)
+                for k in range(-r, r + 1)
+            ],
+            device=frac.device,
+            dtype=frac.dtype,
+        )
+        delta = frac[:, None, None, :] - frac[None, :, None, :]
+        delta = delta + shifts[None, None, :, :]
+        cart = torch.einsum("...i,ij->...j", delta, cell)
+        distances = torch.linalg.vector_norm(cart, dim=-1)
+        zero_shift = int(((shifts == 0).all(dim=1)).nonzero()[0].item())
+        ids = torch.arange(frac.shape[0], device=frac.device)
+        distances = distances.clone()
+        distances[ids, ids, zero_shift] = float("inf")
+        return distances.reshape(frac.shape[0], -1).amin(dim=1)
+
+    def _gaussian_energy(self, nearest, effective_sigma):
+        z = (nearest - self.nn_mu) / effective_sigma
+        # Smooth-L1 prevents a tiny number of severe contacts from dominating
+        # every gradient while still exerting a strong restoring force.
+        return torch.nn.functional.smooth_l1_loss(
+            z, torch.zeros_like(z), beta=1.0, reduction="mean"
+        )
+
+    def _relative_density(self, dmin, effective_sigma):
+        z = (float(dmin) - self.nn_mu) / effective_sigma
+        return float(np.exp(-0.5 * z * z))
+
+    @staticmethod
+    def _periodic_delta(current, initial):
+        delta = current - initial
+        return delta - torch.round(delta)
+
+    def _project_(self, parameters, initial, dof_mask):
+        with torch.no_grad():
+            delta = self._periodic_delta(parameters, initial)
+            norms = torch.linalg.vector_norm(delta, dim=1, keepdim=True)
+            scale = torch.clamp(
+                self.trust_radius / norms.clamp_min(1.0e-12), max=1.0
+            )
+            delta = delta * scale
+            parameters.copy_((initial + delta).remainder(1.0))
+            parameters.mul_(dof_mask)
+
+    def _initial_parameters(self, dofs):
+        values = np.zeros((len(dofs), 3), dtype=np.float32)
+        for site, dof in enumerate(dofs):
+            if dof > 0:
+                # Uniform crystallographic exploration plus a Gaussian
+                # perturbation, wrapped periodically.
+                values[site, :dof] = (
+                    self.rng.random(dof)
+                    + self.rng.normal(0.0, 0.05, size=dof)
+                ) % 1.0
+        return values
+
+    def _condition_candidate(self, spg, token, cell_np):
+        wp_indices = [int(wp) for wp in token if int(wp) >= 0]
+        if not wp_indices:
+            return None
+
+        group = self._group(spg)
+        dofs = []
+        for wp_index in wp_indices:
+            if wp_index >= len(group):
+                return None
+            _, _, dof = self._site_template(spg, wp_index)
+            dofs.append(dof)
+
+        dof_mask = torch.zeros(
+            (len(wp_indices), 3), device=self.device, dtype=torch.float32
+        )
+        for site, dof in enumerate(dofs):
+            dof_mask[site, :dof] = 1.0
+
+        cell = torch.as_tensor(cell_np, device=self.device, dtype=torch.float32)
+
+        # Sample the chemistry-prior component once per candidate skeleton.
+        # Most candidates use the fitted narrow Gaussian; a controlled minority
+        # uses a broader Gaussian that remains centered on the same NN peak.
+        broad_component = bool(self.rng.random() < self.broad_fraction)
+        effective_sigma = (
+            self.nn_sigma * self.broad_sigma_scale
+            if broad_component
+            else self.nn_sigma
+        )
+
+        gate_threshold = float(
+            np.exp(
+                self.rng.uniform(
+                    np.log(self.gate_density_min),
+                    np.log(self.gate_density_max),
+                )
+            )
+        )
+
+        passing_starts = []
+        best_raw = None
+
+        for _ in range(self.restarts):
+            initial_np = self._initial_parameters(dofs)
+            initial = torch.as_tensor(
+                initial_np, device=self.device, dtype=torch.float32
+            )
+            with torch.no_grad():
+                frac = self._expanded_positions(spg, wp_indices, initial)
+                nearest = self._nearest_distances(frac, cell)
+                dmin = float(nearest.min().cpu())
+                density = self._relative_density(dmin, effective_sigma)
+                energy = float(
+                    self._gaussian_energy(nearest, effective_sigma).cpu()
+                )
+
+            if density >= gate_threshold:
+                passing_starts.append((initial_np, energy, dmin, density))
+            if best_raw is None or energy < best_raw[1]:
+                best_raw = (initial_np, energy, dmin, density)
+
+        if not passing_starts:
+            return None
+
+        best = None
+        for initial_np, raw_energy, raw_dmin, density in passing_starts:
+            initial = torch.tensor(
+                initial_np,
+                device=self.device,
+                dtype=torch.float32,
+            )
+            parameters = initial.detach().clone().requires_grad_(True)
+
+            if sum(dofs) > 0 and self.optimize_steps > 0:
+                optimizer = torch.optim.Adam(
+                    [parameters], lr=self.optimize_lr
+                )
+                for _ in range(self.optimize_steps):
+                    optimizer.zero_grad()
+                    frac = self._expanded_positions(
+                        spg, wp_indices, parameters
+                    )
+                    nearest = self._nearest_distances(frac, cell)
+                    energy = self._gaussian_energy(
+                        nearest, effective_sigma
+                    )
+                    if not energy.requires_grad or not torch.isfinite(energy):
+                        break
+                    energy.backward()
+                    torch.nn.utils.clip_grad_norm_([parameters], 5.0)
+                    optimizer.step()
+                    self._project_(parameters, initial, dof_mask)
+
+            with torch.no_grad():
+                # Preserve a small Gaussian source of diversity after the
+                # smooth drift; there is intentionally no second hard gate.
+                if self.final_noise_std > 0 and sum(dofs) > 0:
+                    noise = torch.randn_like(parameters) * self.final_noise_std
+                    parameters.add_(noise * dof_mask)
+                    self._project_(parameters, initial, dof_mask)
+
+                frac = self._expanded_positions(
+                    spg, wp_indices, parameters
+                )
+                nearest = self._nearest_distances(frac, cell)
+                final_energy = float(
+                    self._gaussian_energy(
+                        nearest, effective_sigma
+                    ).cpu()
+                )
+                final_dmin = float(nearest.min().cpu())
+                final_free = parameters.cpu().numpy().copy()
+
+            candidate = {
+                "free": final_free,
+                "energy": final_energy,
+                "dmin": final_dmin,
+                "raw_dmin": raw_dmin,
+                "raw_density": density,
+                "broad_component": broad_component,
+                "effective_sigma": effective_sigma,
+                "gate_threshold": gate_threshold,
+            }
+            if best is None or final_energy < best["energy"]:
+                best = candidate
+
+        return best
+
+    def __call__(
+        self,
+        global_batch_df,
+        parsed_si_tokens,
+        preallowed,
+        si_category_logits,
+        topk,
+    ):
+        n_rows, n_categories = preallowed.shape
+        n_sites = max(len(token) for token in parsed_si_tokens)
+        allowed = np.zeros_like(preallowed, dtype=bool)
+        best_free = np.full(
+            (n_rows, n_categories, n_sites, 3),
+            np.nan,
+            dtype=np.float32,
+        )
+        best_score = np.full(
+            (n_rows, n_categories), np.inf, dtype=np.float32
+        )
+        best_dmin = np.full(
+            (n_rows, n_categories), np.nan, dtype=np.float32
+        )
+        logit_bias = np.full(
+            (n_rows, n_categories), -1.0e9, dtype=np.float32
+        )
+
+        tested = passed = broad_passed = 0
+        topk = max(1, min(int(topk), n_categories))
+
+        for row_index, (_, row) in enumerate(global_batch_df.iterrows()):
+            if (
+                self.progress_every > 0
+                and row_index > 0
+                and row_index % self.progress_every == 0
+            ):
+                print(
+                    f"  Si Gaussian conditioning: {row_index}/{n_rows} rows; "
+                    f"rows with candidate={int(allowed[:row_index].any(axis=1).sum())}"
+                )
+
+            try:
+                spg = int(round(float(row["spg"])))
+                cell = _cell_matrix_numpy(row)
+            except Exception:
+                continue
+            if not 1 <= spg <= 230:
+                continue
+
+            candidate_ids = np.where(preallowed[row_index])[0]
+            if candidate_ids.size == 0:
+                continue
+            ranked = candidate_ids[
+                np.argsort(si_category_logits[row_index, candidate_ids])[::-1]
+            ][:topk]
+
+            for category in ranked:
+                tested += 1
+                result = self._condition_candidate(
+                    spg, parsed_si_tokens[int(category)], cell
+                )
+                if result is None:
+                    continue
+                passed += 1
+                broad_passed += int(result["broad_component"])
+                allowed[row_index, int(category)] = True
+                free = result["free"]
+                best_free[
+                    row_index, int(category), : free.shape[0], :
+                ] = free
+                best_score[row_index, int(category)] = result["energy"]
+                best_dmin[row_index, int(category)] = result["dmin"]
+                logit_bias[row_index, int(category)] = (
+                    -self.logit_beta * result["energy"]
+                )
+
+        print(
+            "  Si Gaussian gate: "
+            f"tested={tested}, passed={passed}, "
+            f"broad_component_passed={broad_passed}; "
+            f"mu={self.nn_mu:.3f} A, sigma={self.nn_sigma:.3f} A, "
+            f"broad_sigma={self.nn_sigma * self.broad_sigma_scale:.3f} A"
+        )
+
+        return {
+            "allowed": allowed,
+            "best_free": best_free,
+            "best_score": best_score,
+            "best_dmin": best_dmin,
+            "logit_bias": logit_bias,
+        }
 
 
 def main():
@@ -538,6 +1134,66 @@ def main():
     )
     parser.add_argument("--cross-cutoff", type=float, default=2.4)
     parser.add_argument("--cross-batch-size", type=int, default=16)
+    parser.add_argument(
+        "--si-nn-hist-bin", type=float, default=0.05,
+        help="Histogram bin width for locating the first training Si-Si NN peak.",
+    )
+    parser.add_argument(
+        "--si-nn-fit-window", type=float, default=0.75,
+        help="Half-width around the first NN peak used for Gaussian fitting.",
+    )
+    parser.add_argument(
+        "--si-nn-sigma-floor", type=float, default=0.20,
+        help="Minimum Gaussian width in angstrom.",
+    )
+    parser.add_argument(
+        "--si-gate-density-min", type=float, default=0.005,
+        help="Minimum sampled relative Gaussian-density threshold.",
+    )
+    parser.add_argument(
+        "--si-gate-density-max", type=float, default=0.05,
+        help="Maximum sampled relative Gaussian-density threshold.",
+    )
+    parser.add_argument(
+        "--si-gate-broad-fraction", type=float, default=0.05,
+        help=(
+            "Fraction of candidate skeletons using the broad chemistry-centered "
+            "Gaussian component."
+        ),
+    )
+    parser.add_argument(
+        "--si-gate-broad-sigma-scale", type=float, default=3.0,
+        help="Width multiplier for the broad Gaussian component.",
+    )
+    parser.add_argument(
+        "--si-pack-restarts", type=int, default=4,
+        help="Random Gaussian-perturbed R0 starts per candidate skeleton.",
+    )
+    parser.add_argument(
+        "--si-pack-opt-steps", type=int, default=12,
+        help="Short smooth packing-refinement steps; zero disables refinement.",
+    )
+    parser.add_argument(
+        "--si-pack-opt-lr", type=float, default=0.03,
+        help="Adam learning rate for smooth R0 refinement.",
+    )
+    parser.add_argument(
+        "--si-pack-trust-radius", type=float, default=0.10,
+        help="Maximum periodic displacement from each sampled R0 start.",
+    )
+    parser.add_argument(
+        "--si-pack-logit-beta", type=float, default=1.0,
+        help="Strength of smooth W0 logit reweighting by packing energy.",
+    )
+    parser.add_argument(
+        "--si-pack-final-noise", type=float, default=0.01,
+        help="Gaussian free-coordinate noise retained after smooth refinement.",
+    )
+    parser.add_argument(
+        "--si-pack-shift-range", type=int, default=2,
+        help="Periodic image range used for Si nearest-neighbor distances.",
+    )
+    parser.add_argument("--si-pack-topk", type=int, default=8)
     args = parser.parse_args()
 
     if not os.path.isfile(args.data):
@@ -550,6 +1206,31 @@ def main():
         raise ValueError("Cross-loss weight must be nonnegative and batch size positive.")
     if not 0.0 <= args.cross_onset < args.cross_cutoff:
         raise ValueError("Require 0 <= --cross-onset < --cross-cutoff.")
+    if args.si_nn_hist_bin <= 0 or args.si_nn_fit_window <= 0:
+        raise ValueError("NN histogram bin and fit window must be positive.")
+    if args.si_nn_sigma_floor <= 0:
+        raise ValueError("--si-nn-sigma-floor must be positive.")
+    if not (
+        0 < args.si_gate_density_min
+        <= args.si_gate_density_max
+        <= 1
+    ):
+        raise ValueError(
+            "Require 0 < gate-density-min <= gate-density-max <= 1."
+        )
+    if not 0 <= args.si_gate_broad_fraction <= 1:
+        raise ValueError("--si-gate-broad-fraction must lie in [0,1].")
+    if args.si_gate_broad_sigma_scale < 1.0:
+        raise ValueError("--si-gate-broad-sigma-scale must be at least 1.")
+    if args.si_pack_restarts < 1 or args.si_pack_opt_steps < 0:
+        raise ValueError("Packing restarts must be positive and steps nonnegative.")
+    if args.si_pack_opt_lr <= 0 or args.si_pack_trust_radius < 0:
+        raise ValueError("Packing LR must be positive and trust radius nonnegative.")
+    if args.si_pack_logit_beta < 0 or args.si_pack_final_noise < 0:
+        raise ValueError("Logit beta and final noise must be nonnegative.")
+    if args.si_pack_shift_range < 1 or args.si_pack_topk < 1:
+        raise ValueError("Shift range and top-k must be positive.")
+
 
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -584,7 +1265,7 @@ def main():
         o_discrete += [c for c in o_df.columns if c != "o_skeleton_token"]
 
     data_name = os.path.splitext(os.path.basename(args.data))[0]
-    model_folder = os.path.join("models", data_name, "FactorizedVAE_v9")
+    model_folder = os.path.join("models", data_name, "FactorizedVAE_v22")
     sample_folder = os.path.join("data", "sample")
     os.makedirs(model_folder, exist_ok=True)
     os.makedirs(sample_folder, exist_ok=True)
@@ -598,10 +1279,47 @@ def main():
     print(f"O columns: {o_df.columns.tolist()}")
     print(f"Discrete cell: {discrete_cell}")
     print(f"Discrete coordinates: {discrete_coordinates}")
-    print(f"Cross loss: weight={args.cross_loss_weight}, onset={args.cross_onset} A, "
-          f"cutoff={args.cross_cutoff} A, rows/batch={args.cross_batch_size}")
-
-    geometry_loss = SoftCoordinationGeometry(canonical_df, n_si_max, n_o_max)
+    print(f"Coordination loss: weight={args.cross_loss_weight}, "
+          f"onset={args.cross_onset} A, cutoff={args.cross_cutoff} A, "
+          f"rows/batch={args.cross_batch_size}")
+    nn_prior = estimate_training_si_nn_gaussian(
+        canonical_df,
+        num_wps,
+        histogram_bin=args.si_nn_hist_bin,
+        fit_window=args.si_nn_fit_window,
+        sigma_floor=args.si_nn_sigma_floor,
+        shift_range=args.si_pack_shift_range,
+    )
+    print(
+        "Si factorization: P(G), Gaussian-gated and smoothly reweighted "
+        "P(W_Si|G,C_NN), noisy-refined P(R_Si|G,W_Si,C_NN)"
+    )
+    print(
+        "Training Si NN Gaussian: "
+        f"peak={nn_prior['peak_center']:.3f} A, "
+        f"mu={nn_prior['mu']:.3f} A, "
+        f"sigma={nn_prior['sigma']:.3f} A; "
+        f"all q05/q50/q95={nn_prior['q05']:.3f}/"
+        f"{nn_prior['q50']:.3f}/{nn_prior['q95']:.3f} A; "
+        f"Npeak/Nall={nn_prior['n_peak']}/{nn_prior['n_all']}"
+    )
+    print(
+        "Si Gaussian gate/refinement: "
+        f"density threshold={args.si_gate_density_min:g}-"
+        f"{args.si_gate_density_max:g}; "
+        f"broad_fraction={args.si_gate_broad_fraction:.3f}; "
+        f"broad_sigma_scale={args.si_gate_broad_sigma_scale:.2f}; "
+        f"restarts={args.si_pack_restarts}; "
+        f"steps={args.si_pack_opt_steps}; "
+        f"trust={args.si_pack_trust_radius:.3f}; "
+        f"final_noise={args.si_pack_final_noise:.3f}; "
+        f"topk={args.si_pack_topk}"
+    )
+    geometry_loss = CrystallographicChemistryGeometry(
+        canonical_df,
+        n_si_max,
+        n_o_max,
+    )
 
     model = FactorizedVAE(
         embedding_dim=128,
@@ -639,6 +1357,25 @@ def main():
         geometry_data=geometry_loss,
     )
 
+    si_packing_feasibility = SiGaussianPackingConditioner(
+        nn_mu=nn_prior["mu"],
+        nn_sigma=nn_prior["sigma"],
+        restarts=args.si_pack_restarts,
+        optimize_steps=args.si_pack_opt_steps,
+        optimize_lr=args.si_pack_opt_lr,
+        trust_radius=args.si_pack_trust_radius,
+        gate_density_min=args.si_gate_density_min,
+        gate_density_max=args.si_gate_density_max,
+        broad_fraction=args.si_gate_broad_fraction,
+        broad_sigma_scale=args.si_gate_broad_sigma_scale,
+        logit_beta=args.si_pack_logit_beta,
+        final_noise_std=args.si_pack_final_noise,
+        shift_range=args.si_pack_shift_range,
+        seed=args.seed,
+        device="cpu",
+    )
+
+
     accepted_batches = []
     accepted_count = 0
     total_generated = 0
@@ -649,6 +1386,8 @@ def main():
         "invalid_space_group": 0,
         "no_compatible_si_skeleton": 0,
         "invalid_si_skeleton": 0,
+        "no_packing_feasible_si_skeleton": 0,
+        "packing_conditioned_si_coordinates": 0,
         "no_compatible_o_skeleton": 0,
     }
     max_sample_rounds = 20
@@ -671,6 +1410,8 @@ def main():
             hard=True,
             enforce_sio2_multiplicity=True,
             max_independent_sites=num_wps,
+            si_skeleton_feasibility=si_packing_feasibility,
+            si_feasibility_topk=args.si_pack_topk,
         )
         total_generated += draw_size
         rejected_multiplicity += int((~multiplicity_valid).sum())
@@ -727,6 +1468,10 @@ def main():
         f"    no compatible Si skeleton: "
         f"{mask_totals['no_compatible_si_skeleton']}\n"
         f"    invalid sampled Si skeleton: {mask_totals['invalid_si_skeleton']}\n"
+        f"    no Si skeleton passing Gaussian gate: "
+        f"{mask_totals['no_packing_feasible_si_skeleton']}\n"
+        f"    Si rows using Gaussian-conditioned R0: "
+        f"{mask_totals['packing_conditioned_si_coordinates']}\n"
         f"    no compatible O skeleton: {mask_totals['no_compatible_o_skeleton']}\n"
         f"  Rejected slot-overflow combinations: {rejected_overflow}\n"
         f"  Rejected Wyckoff reconstructions: {rejected_reconstruction}\n"
@@ -735,7 +1480,7 @@ def main():
 
     output = os.path.join(
         sample_folder,
-        f"{data_name}-FactorizedVAE-v9-seed{args.seed}-{args.sample}.csv",
+        f"{data_name}-FactorizedVAE-v22-seed{args.seed}-{args.sample}.csv",
     )
     synthetic.to_csv(output, index=False)
     final_model = os.path.join(model_folder, "models", "FactorizedVAE_final.pkl")
