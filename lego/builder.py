@@ -16,6 +16,7 @@ Todo:
 
 # Standard Libraries
 import os
+import json
 from copy import deepcopy
 import numpy as np
 from scipy.optimize import minimize
@@ -102,38 +103,23 @@ def restore_target_coordination(xtal, targets):
         set_target_coordination(site, target)
 
 
-def build_site_reference_matrix(targets, reference_bank, sites=None):
+def build_site_reference_matrix(targets, reference_bank):
     """Build one SO3 reference row per independent atom site."""
     if reference_bank is None:
         raise ValueError("No target-coordination reference bank was defined.")
 
     refs = []
 
-    if sites is not None and len(sites) != len(targets):
-        raise ValueError(
-            "Site count does not match target-coordination count: "
-            f"{len(sites)} versus {len(targets)}."
-        )
-
     for index, target in enumerate(targets):
         target = int(target)
-        specie = None
-        if sites is not None:
-            site = sites[index]
-            specie = site[0] if isinstance(site, tuple) else site.specie
-            specie = str(specie)
 
-        key = (specie, target) if specie is not None else target
-        if key not in reference_bank and target in reference_bank:
-            key = target
-
-        if key not in reference_bank:
+        if target not in reference_bank:
             raise ValueError(
-                "No reference environment exists for "
-                f"site {index} ({specie}, CN={target})."
+                f"No reference environment exists for target CN={target} "
+                f"at atom site {index}."
             )
 
-        ref = np.asarray(reference_bank[key], dtype=float)
+        ref = np.asarray(reference_bank[target], dtype=float)
 
         if ref.ndim == 2:
             if ref.shape[0] != 1:
@@ -157,7 +143,7 @@ def build_site_reference_matrix(targets, reference_bank, sites=None):
 def check_target_coordination(xtal, verbose=False):
     """Validate actual coordination against each site's persistent target."""
     try:
-        xtal.set_site_coordination(exclude_ii=len(xtal.species) > 1)
+        xtal.set_site_coordination()
     except Exception as exc:
         if verbose:
             print(
@@ -286,6 +272,80 @@ def minimize_from_x_par(*args):
     return xtals, xs
 
 
+
+def _expand_element_references(wps, ref_environments):
+    """Expand one reference descriptor per element to one row per site."""
+    refs = []
+    for element_index, wp_group in enumerate(wps):
+        ref = np.asarray(ref_environments[element_index], dtype=float)
+        if ref.ndim != 1:
+            ref = ref.reshape(-1)
+        refs.extend(ref.copy() for _ in wp_group)
+    if not refs:
+        raise ValueError("No independent sites were supplied for SO3 optimization.")
+    return np.vstack(refs)
+
+
+def minimize_one_xtal_par(payload):
+    """Optimize one structure in a silent worker and return structured output."""
+    (
+        task_id,
+        source_tag,
+        sim0,
+        x,
+        dim,
+        spg,
+        wps,
+        elements,
+        calculator,
+        ref_environments,
+        opt_type,
+        T,
+        niter,
+        early_quit,
+        minimizers,
+    ) = payload
+    try:
+        result = minimize_from_x(
+            x,
+            dim,
+            spg,
+            wps,
+            elements,
+            calculator,
+            ref_environments,
+            T,
+            niter,
+            early_quit,
+            opt_type,
+            minimizers,
+            filename=None,
+            target_coordination=None,
+            reference_environment_bank=None,
+        )
+        if result is None:
+            return task_id, source_tag, sim0, None, None, None, "optimizer_returned_none"
+
+        xtal, xs = result
+        ref_matrix = _expand_element_references(wps, ref_environments)
+        sim1 = calculate_S(
+            xtal.get_1d_rep_x(),
+            xtal,
+            ref_matrix,
+            calculator,
+        )
+        return task_id, source_tag, sim0, xtal, xs, float(sim1), None
+    except Exception as exc:
+        return (
+            task_id,
+            source_tag,
+            sim0,
+            None,
+            None,
+            None,
+            f"{type(exc).__name__}: {exc}",
+        )
+
 def generate_xtal(dim, spg, wps, niter, elements, calculator,
                   ref_environments, criteria, T, N_max, early_quit,
                   dump=False, random_state=None, verbose=False):
@@ -404,7 +464,6 @@ def minimize_from_x(
         ref_envs = build_site_reference_matrix(
             target_coordination,
             reference_environment_bank,
-            sites=sites,
         )
     
     # Original element-specific mode.
@@ -521,22 +580,42 @@ def minimize_from_x(
                     f0.write(strs)
         callback = print_local_fun if filename is not None else None
 
+        previous_stage_value = float(sim0)
         for minimizer in minimizers:
+            # Do not spend another optimizer stage once the structure already
+            # satisfies the production SO3 handoff threshold.
+            if previous_stage_value <= early_quit:
+                break
+
             (method, step) = minimizer
-            #print("Starting", xtal.lattice, method, step)
             if len(x) != len(bounds):
                 print('debug min', xtal, x, bounds, len(x), len(bounds))
-            res = minimize(calculate_S, x,
-                           method=method,
-                           args=(xtal, ref_envs, calculator),
-                           jac=None if method=='Nelder-Mead' else jac,
-                           bounds=bounds,
-                           options={'maxiter': step}, #'disp': True},
-                           callback=callback)
+            res = minimize(
+                calculate_S,
+                x,
+                method=method,
+                args=(xtal, ref_envs, calculator),
+                jac=None if method == 'Nelder-Mead' else jac,
+                bounds=bounds,
+                options={'maxiter': step},
+                callback=callback,
+            )
             x = res.x
             if xtal.lattice is None:
                 return None
-            #import sys; sys.exit()
+
+            stage_value = float(calculate_S(x, xtal, ref_envs, calculator))
+            # Stop when the requested SO3 quality has been reached.
+            if stage_value <= early_quit:
+                previous_stage_value = stage_value
+                break
+            # Stop a stalled sequence rather than launching another expensive
+            # numerical-gradient stage with negligible benefit.
+            improvement = previous_stage_value - stage_value
+            if improvement <= max(1.0e-8, 1.0e-5 * abs(previous_stage_value)):
+                previous_stage_value = stage_value
+                break
+            previous_stage_value = stage_value
 
         if filename is not None:
             with open(filename, 'a+') as f0:
@@ -752,12 +831,17 @@ class builder(object):
         references,
         substitute=None,
     ):
-        """Set site-reference SO3 environments.
+        """Set one prototype SO3 environment for each target coordination.
 
-        Keys may be integer coordination targets for elemental systems or
-        ``(central_species, target_coordination)`` tuples for compounds.
-        A compound reference CIF may be reused for multiple keys; the SO3
-        descriptor is extracted at the first atom of the requested species.
+        Parameters
+        ----------
+        references : dict
+            Mapping such as:
+
+                {
+                    3: "graphite.cif",
+                    4: "diamond.cif",
+                }
         """
         if self.calculator is None:
             raise RuntimeError(
@@ -766,20 +850,8 @@ class builder(object):
 
         bank = {}
 
-        for raw_key, cif_file in references.items():
-            if isinstance(raw_key, tuple):
-                if len(raw_key) != 2:
-                    raise ValueError(
-                        "Compound reference keys must be "
-                        "(central_species, target_coordination)."
-                    )
-                central_species = str(raw_key[0])
-                target = int(raw_key[1])
-                key = (central_species, target)
-            else:
-                central_species = self.elements[0]
-                target = int(raw_key)
-                key = target
+        for target, cif_file in references.items():
+            target = int(target)
 
             xtal = pyxtal()
             xtal.from_seed(cif_file)
@@ -788,28 +860,36 @@ class builder(object):
                 xtal.substitute(substitute)
 
             xtal.resort_species(self.elements)
-            atoms = xtal.to_ase(resort=False)
 
-            atom_index = None
+            ids = [0] * len(self.elements)
             count = 0
+
             for site in xtal.atom_sites:
-                if site.specie == central_species:
-                    atom_index = count
-                    break
+                for i, element in enumerate(self.elements):
+                    if element == site.specie:
+                        ids[i] = count
+                        break
+
                 count += site.multiplicity
 
-            if atom_index is None:
-                raise ValueError(
-                    f"Reference {cif_file} contains no {central_species} site."
+            atoms = xtal.to_ase(resort=False)
+            refs = self.calculator.compute_p(
+                atoms,
+                ids,
+            )
+
+            if len(self.elements) != 1:
+                raise NotImplementedError(
+                    "The first target-coordination implementation currently "
+                    "supports an elemental system only."
                 )
 
-            refs = self.calculator.compute_p(atoms, [atom_index])
             ref = np.asarray(refs[0], dtype=float)
-            bank[key] = ref
+            bank[target] = ref
 
             if self.verbose:
                 print(
-                    f"Reference {central_species} target CN={target}: "
+                    f"Reference target CN={target}: "
                     f"{cif_file}, descriptor shape={ref.shape}"
                 )
 
@@ -869,57 +949,23 @@ class builder(object):
         g = xtal.group
         sites = [[] for _ in self.elements]
         dof = xtal.lattice.dof
-
-        # Normalize both sides to symbols. PyXtal site species may be species
-        # objects while ``self.elements`` contains strings.
-        element_symbols = [str(specie) for specie in self.elements]
-        matched_site_count = 0
-
         for s in xtal.atom_sites:
-            site_symbol = str(s.specie)
-            matched = False
-
-            for i, element_symbol in enumerate(element_symbols):
-                if site_symbol == element_symbol:
+            for i, specie in enumerate(self.elements):
+                if s.specie == specie:
+                    # wp_combo[i].append(s.wp)
                     sites[i].append(s.wp.get_label())
-                    matched = True
-                    matched_site_count += 1
                     break
-
-            if not matched:
-                raise ValueError(
-                    "Decoded atom site was not assigned to any builder element: "
-                    f"site species={s.specie!r}, normalized={site_symbol!r}, "
-                    f"builder elements={self.elements!r}, "
-                    f"normalized elements={element_symbols!r}."
-                )
-
             dof += s.wp.get_dof()
-
-        if matched_site_count != len(xtal.atom_sites):
-            raise ValueError(
-                "Species-to-builder mapping lost decoded atom sites: "
-                f"matched={matched_site_count}, "
-                f"decoded={len(xtal.atom_sites)}."
-            )
-
-        missing_elements = [
-            element_symbols[i]
-            for i, element_sites in enumerate(sites)
-            if len(element_sites) == 0
-        ]
-        if missing_elements:
-            raise ValueError(
-                "One or more required builder elements have no decoded "
-                "Wyckoff sites: "
-                f"missing={missing_elements}, sites={sites}, "
-                f"builder elements={self.elements!r}."
-            )
 
         return g.number, sites, dof
 
     def get_similarity(self, xtal):
-        """Compute similarity using global or site-specific references."""
+        """Compute the multiplicity-weighted SO3 objective for one crystal.
+
+        ``set_reference_enviroments`` stores one descriptor row per element,
+        while ``calculate_S`` requires one reference row per independent site.
+        Expand the elemental rows here in the exact ``xtal.atom_sites`` order.
+        """
         x = xtal.get_1d_rep_x()
 
         if self.use_target_coordination:
@@ -927,10 +973,34 @@ class builder(object):
             ref_environments = build_site_reference_matrix(
                 targets,
                 self.reference_environment_bank,
-                sites=xtal.atom_sites,
             )
         else:
-            ref_environments = self.ref_environments
+            if self.ref_environments is None:
+                raise RuntimeError("Reference SO3 environments are not initialized.")
+
+            elemental_refs = np.asarray(self.ref_environments, dtype=float)
+            if elemental_refs.ndim == 1:
+                elemental_refs = elemental_refs.reshape(1, -1)
+            if elemental_refs.shape[0] != len(self.elements):
+                raise ValueError(
+                    "Element-reference count does not match builder elements: "
+                    f"{elemental_refs.shape[0]} versus {len(self.elements)}."
+                )
+
+            reference_by_element = {
+                str(element): elemental_refs[index]
+                for index, element in enumerate(self.elements)
+            }
+            site_refs = []
+            for index, site in enumerate(xtal.atom_sites):
+                symbol = str(site.specie)
+                if symbol not in reference_by_element:
+                    raise ValueError(
+                        f"No SO3 reference is defined for site {index} "
+                        f"with species {symbol!r}."
+                    )
+                site_refs.append(reference_by_element[symbol])
+            ref_environments = np.vstack(site_refs)
 
         return calculate_S(
             x,
@@ -974,7 +1044,8 @@ class builder(object):
     def optimize_xtals(self, xtals, ncpu=1, opt_type='local',
                        T=0.2, niter=20, early_quit=0.02,
                        add_db=True, symmetrize=False,
-                       minimizers=[('Nelder-Mead', 100), ('L-BFGS-B', 100)],
+                       minimizers=[('Nelder-Mead', 50), ('L-BFGS-B', 150)],
+                       max_initial_similarity=None,
                        ):
         """
         Perform optimization for each structure
@@ -984,11 +1055,13 @@ class builder(object):
             ncpu (int):
 
         """
-        args = (opt_type, T, niter, early_quit, add_db, symmetrize, minimizers)
-        if ncpu == 1:
-            valid_xtals = self.optimize_xtals_serial(xtals, args)
-        else:
-            valid_xtals = self.optimize_xtals_mproc(xtals, ncpu, args)
+        args = (
+            opt_type, T, niter, early_quit, add_db, symmetrize, minimizers,
+            max_initial_similarity,
+        )
+        # Use the same one-structure task path for serial and parallel runs so
+        # provenance, SO3 result reporting, and failure handling are identical.
+        valid_xtals = self.optimize_xtals_mproc(xtals, ncpu, args)
         return valid_xtals
 
     @staticmethod
@@ -1053,94 +1126,161 @@ class builder(object):
         return xtals_opt
 
     def optimize_xtals_mproc(self, xtals, ncpu, args):
-        """
-        Optimization in multiprocess mode.
+        """Optimize structures dynamically with one structure per worker task."""
+        (
+            opt_type, T, niter, early_quit, add_db, symmetrize, minimizers,
+            max_initial_similarity,
+        ) = args
+        if self.use_target_coordination:
+            raise RuntimeError(
+                "Dynamic SiO2 production mode requires direct element-specific "
+                "SO3 references, not target-coordination routing."
+            )
+        if self.ref_environments is None:
+            raise RuntimeError("Reference SO3 environments have not been initialized.")
 
-        Args:
-            xtals: list of xtals
-            ncpu (int): number of parallel python processes
-            args: (opt_type, T, n_iter, early_quit, add_db, symmetrize, minimizers)
-        """
+        tasks = []
+        prescreen_results = []
+        initial_similarities = []
+        for task_id, xtal in enumerate(xtals):
+            sim0 = float(self.get_similarity(xtal))
+            initial_similarities.append(sim0)
+            source_tag = deepcopy(getattr(xtal, "tag", {}) or {})
+            if (
+                max_initial_similarity is not None
+                and np.isfinite(max_initial_similarity)
+                and sim0 > max_initial_similarity
+            ):
+                prescreen_results.append({
+                    "task_id": int(task_id),
+                    "source_row": source_tag.get("source_row"),
+                    "similarity0": sim0,
+                    "similarity": None,
+                    "status": False,
+                    "error": "initial_so3_above_prescreen",
+                })
+                continue
+            x = xtal.get_1d_rep_x()
+            _, wps, _ = self.get_input_from_ref_xtal(xtal)
+            tasks.append(
+                (
+                    task_id,
+                    source_tag,
+                    sim0,
+                    x,
+                    self.dim,
+                    xtal.group.number,
+                    wps,
+                    self.elements,
+                    self.calculator,
+                    self.ref_environments,
+                    opt_type,
+                    T,
+                    niter,
+                    early_quit,
+                    minimizers,
+                )
+            )
 
-        pool = Pool(processes=ncpu)
-        (opt_type, T, niter, early_quit, add_db, symmetrize, minimizers) = args
-        xtals_opt = deque()
+        if initial_similarities:
+            q05, q25, q50, q75, q95 = np.quantile(
+                np.asarray(initial_similarities, dtype=float),
+                [0.05, 0.25, 0.50, 0.75, 0.95],
+            )
+            print(
+                "Initial SO3 q05/q25/q50/q75/q95 = "
+                f"{q05:.3f} {q25:.3f} {q50:.3f} {q75:.3f} {q95:.3f}"
+            )
 
-        # Split the input structures to minibatches
-        N_batches = 50 * ncpu
-        for _i, i in enumerate(range(0, len(xtals), N_batches)):
-            start, end = i, min([i+N_batches, len(xtals)])
-            ids = list(range(start, end))
-            print(f"Rank {self.rank} minibatch {start} {end}")
-            self.print_memory_usage()
+        total = len(tasks)
+        progress_every = max(1, total // 20) if total else 1
+        valid_xtals = []
+        results_table = list(prescreen_results)
 
-            def generate_args():
-                """
-                A generator to yield argument lists for minimize_from_x_par.
-                """
-                for j in range(ncpu):
-                    _ids = ids[j::ncpu]
-                    wp_libs = []
-                    for id in _ids:
-                        xtal = xtals[id]
-                        x = xtal.get_1d_rep_x()
-                        spg, wps, _ = self.get_input_from_ref_xtal(xtal)
-                        if self.use_target_coordination:
-                            targets = get_target_coordination_vector(
-                                xtal,
-                                strict=True,
-                            )
-                            wp_libs.append(
-                                (
-                                    x,
-                                    xtal.group.number,
-                                    wps,
-                                    targets,
-                                )
-                            )
-                        else:
-                            wp_libs.append(
-                                (
-                                    x,
-                                    xtal.group.number,
-                                    wps,
-                                )
-                            )
-                    yield (
-                        self.dim,
-                        wp_libs,
-                        self.elements,
-                        self.calculator,
-                        self.ref_environments,
-                        self.reference_environment_bank,
-                        opt_type,
-                        T,
-                        niter,
-                        early_quit,
-                        minimizers,
+        if prescreen_results:
+            print(
+                f"SO3 initial screen: skipped {len(prescreen_results)}/"
+                f"{len(xtals)} above {max_initial_similarity:g}"
+            )
+
+        if total == 0:
+            self.last_optimization_results = sorted(
+                results_table, key=lambda item: item["task_id"]
+            )
+            return valid_xtals
+
+        with Pool(processes=max(1, ncpu)) as pool:
+            iterator = pool.imap_unordered(
+                minimize_one_xtal_par,
+                tasks,
+                chunksize=1,
+            )
+            for completed, result in enumerate(iterator, start=1):
+                (
+                    task_id,
+                    source_tag,
+                    sim0,
+                    xtal,
+                    xs,
+                    sim1,
+                    error,
+                ) = result
+
+                status = False
+                if xtal is not None:
+                    xtal.tag = deepcopy(source_tag)
+                    status = xtal.check_validity(
+                        self.criteria,
+                        verbose=False,
                     )
 
-            # Use the generator to pass args to reduce memory usage
-            _xtal, _xs = None, None
-            for result in pool.imap_unordered(minimize_from_x_par,
-                                              generate_args(),
-                                              chunksize=1):
-                if result is not None:
-                    (_xtals, _xs) = result
-                    valid_xtals = self.process_xtals(
-                        _xtals, _xs, add_db, symmetrize)
-                    xtals_opt.extend(valid_xtals)  # Use deque to reduce memory
+                if status:
+                    if symmetrize:
+                        pre_symmetrize = xtal
+                        pmg = xtal.to_pymatgen()
+                        xtal = pyxtal()
+                        xtal.from_seed(pmg)
+                        xtal.tag = deepcopy(source_tag)
+                        self._copy_site_properties(pre_symmetrize, xtal)
 
-            # Remove the duplicate structures
-            #self.db.update_row_topology(overwrite=False, prefix=self.prefix)
-            #self.db.clean_structures_spg_topology(dim=self.dim)
+                    if add_db:
+                        self.process_xtal(
+                            xtal,
+                            [sim0, sim1],
+                            task_id,
+                            xs=xs,
+                            print_output=False,
+                        )
+                    valid_xtals.append(xtal)
+                elif error is None:
+                    error = "post_optimization_validity_failed"
 
-            # After each minibatch, delete the local variables and run garbage collection
-            del ids, _xtals, _xs
+                results_table.append(
+                    {
+                        "task_id": int(task_id),
+                        "source_row": source_tag.get("source_row"),
+                        "similarity0": float(sim0),
+                        "similarity": None if sim1 is None else float(sim1),
+                        "status": bool(status),
+                        "error": error,
+                    }
+                )
 
-        xtals_opt = list(xtals_opt)
-        print(f"Rank {self.rank} finish optimize_xtals_mproc {len(xtals_opt)}")
-        return xtals_opt
+                if completed % progress_every == 0 or completed == total:
+                    print(
+                        f"SO3 progress: {completed}/{total}; "
+                        f"accepted={len(valid_xtals)}"
+                    )
+
+        self.last_optimization_results = sorted(
+            results_table,
+            key=lambda item: item["task_id"],
+        )
+        print(
+            f"Rank {self.rank} finish optimize_xtals_mproc "
+            f"{len(valid_xtals)}"
+        )
+        return valid_xtals
 
     def optimize_reps(self, reps, ncpu=1, opt_type='local',
                       T=0.2, niter=20, early_quit=0.02,
@@ -1688,7 +1828,8 @@ class builder(object):
                             count += 1
 
     def process_xtal(self, xtal, sim, count=0, xs=None, energy=None,
-                     topology=None, same_group=True, db=None, check=False):
+                     topology=None, same_group=True, db=None, check=False,
+                     print_output=True):
         """
         Check, print and add xtal to the database
 
@@ -1714,7 +1855,8 @@ class builder(object):
                  'sim': "{:12.3f} => {:6.3f}".format(sim[0], sim[1])
                  }
         strs = xtal.get_xtal_string(dicts, header)
-        print(strs)
+        if print_output:
+            print(strs)
         self.logging.info(strs)
         kvp = {
             'similarity0': sim[0],
@@ -1727,6 +1869,23 @@ class builder(object):
             kvp['ff_energy'] = energy
         if topology is not None:
             kvp['topology'] = topology
+
+        tag = getattr(xtal, "tag", None)
+        if isinstance(tag, dict):
+            if tag.get("source_row") is not None:
+                kvp["source_row"] = int(tag["source_row"])
+            if tag.get("representative_source_row") is not None:
+                kvp["representative_source_row"] = int(
+                    tag["representative_source_row"]
+                )
+            if tag.get("generation_count") is not None:
+                kvp["generation_count"] = int(tag["generation_count"])
+            if tag.get("source_rows") is not None:
+                kvp["source_rows_json"] = json.dumps(
+                    [int(value) for value in tag["source_rows"]],
+                    separators=(",", ":"),
+                )
+
         if status:
             db.add_xtal(xtal, kvp)
 
@@ -1834,5 +1993,4 @@ if __name__ == "__main__":
             xtals.append(xtal)
             bu.optimize_xtal(xtal)
         bu.optimize_xtals(xtals)
-
 

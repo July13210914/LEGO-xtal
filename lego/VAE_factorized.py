@@ -4,8 +4,9 @@ The decoder is explicitly sequential:
     global       = D_global(z)
     Si skeleton  = D_Si_skel(z, global_context)
     Si params    = D_Si_param(z, global_context, sampled_Si_skeleton)
-    O skeleton   = D_O_skel(z, global_context, complete_Si_context)
-    O params     = D_O_param(z, global_context, complete_Si_context, sampled_O_skeleton)
+    O proposal z = z + E_Si(complete_Si) + E_noise(epsilon_O)
+    O skeleton   = D_O_skel(z_O, global_context, complete_Si_context)
+    O params     = D_O_param(z_O, global_context, complete_Si_context, sampled_O_skeleton)
 
 Each block owns a separate DataTransformer, allowing categorical skeleton tokens
 and continuous coordinates to be reconstructed with the existing LEGO loss.
@@ -20,10 +21,9 @@ from torch.nn import Linear, Module, ModuleList, Parameter, ReLU, Sequential
 from torch.nn.functional import cross_entropy
 from torch.optim import Adam
 from torch.utils.data import DataLoader, TensorDataset
-from tqdm import tqdm
 from pyxtal.symmetry import Group
 
-# v22: narrow/broad training-Gaussian mixture with smooth W reweighting and noisy R0 refinement.
+# v34: fixed-Si repeated oxygen proposals with direct Si latent conditioning.
 
 from .data_transformer import DataTransformer
 from .base import BaseSynthesizer, random_state
@@ -280,10 +280,10 @@ class FactorizedVAE(BaseSynthesizer):
         kl_warmup_epochs=0,
         predicted_context_start=0.0,
         predicted_context_end=0.8,
-        cross_loss_weight=0.1,
-        cross_onset=2.0,
-        cross_cutoff=2.4,
-        cross_batch_size=16,
+        shell_loss_weight=1.0,
+        shell_batch_size=16,
+        o_noise_dim=32,
+        o_noise_scale=1.0,
         cuda=True,
         verbose=False,
         folder="LEGO-FactorizedVAE",
@@ -303,10 +303,10 @@ class FactorizedVAE(BaseSynthesizer):
         self.kl_warmup_epochs = kl_warmup_epochs
         self.predicted_context_start = predicted_context_start
         self.predicted_context_end = predicted_context_end
-        self.cross_loss_weight = float(cross_loss_weight)
-        self.cross_onset = float(cross_onset)
-        self.cross_cutoff = float(cross_cutoff)
-        self.cross_batch_size = int(cross_batch_size)
+        self.shell_loss_weight = float(shell_loss_weight)
+        self.shell_batch_size = int(shell_batch_size)
+        self.o_noise_dim = int(o_noise_dim)
+        self.o_noise_scale = float(o_noise_scale)
         self.verbose = verbose
         self.root_folder = folder
 
@@ -373,6 +373,15 @@ class FactorizedVAE(BaseSynthesizer):
         self.si_context_encoder = MLP(
             si_dim, (self.context_dim,), self.context_dim
         ).to(self._device)
+        # A second, direct complete-Si embedding enters the oxygen latent path.
+        # This prevents oxygen from depending only on one pooled context branch.
+        self.o_si_latent_encoder = MLP(
+            si_dim, (self.context_dim, self.context_dim), self.embedding_dim
+        ).to(self._device)
+
+        self.o_noise_encoder = MLP(
+            self.o_noise_dim, (self.context_dim,), self.embedding_dim
+        ).to(self._device)
 
         self.o_skeleton_decoder = ConditionalDecoder(
             self.embedding_dim + 2 * self.context_dim,
@@ -397,6 +406,8 @@ class FactorizedVAE(BaseSynthesizer):
             self.si_skeleton_context_encoder,
             self.si_coordinate_decoders,
             self.si_context_encoder,
+            self.o_si_latent_encoder,
+            self.o_noise_encoder,
             self.o_skeleton_decoder,
             self.o_skeleton_context_encoder,
             self.o_coordinate_decoder,
@@ -407,7 +418,7 @@ class FactorizedVAE(BaseSynthesizer):
             "encoder", "global_decoder", "global_context_encoder",
             "si_skeleton_decoder", "si_skeleton_context_encoder",
             "si_coordinate_decoders", "si_context_encoder",
-            "o_skeleton_decoder", "o_skeleton_context_encoder",
+            "o_si_latent_encoder", "o_noise_encoder", "o_skeleton_decoder", "o_skeleton_context_encoder",
             "o_coordinate_decoder", "global_transformer", "si_transformer",
             "o_transformer",
         ]}
@@ -417,9 +428,17 @@ class FactorizedVAE(BaseSynthesizer):
                 "embedding_dim": self.embedding_dim,
                 "context_dim": self.context_dim,
                 "decoder_stages": 5,
+                "oxygen_geometry_objective": "si_fixed_ordered_d1_d4_d5_d1_d2_d3",
+                "oxygen_sampling": "fixed_si_error_conditioned_otf_adapter",
+                "o_noise_dim": self.o_noise_dim,
+                "o_noise_scale": self.o_noise_scale,
+                "sampling_selector": "si_nn_then_o_d1_d4_d5_d1_d2_d3",
                 "si_coordinate_mode": "sitewise_autoregressive",
-                "si_skeleton_conditioning": "training_gaussian_mixture_gate_plus_smooth_packing_bias",
-                "si_coordinate_conditioning": "best_packing_realization_from_selected_skeleton",
+                "si_skeleton_conditioning": "multiplicity_mask_only",
+                "si_coordinate_conditioning": "sitewise_autoregressive",
+                "o_skeleton_conditioning": "global_plus_complete_si",
+                "o_coordinate_conditioning": "global_plus_complete_si_plus_o_skeleton",
+                "o_topology_selection": "disabled_baseline",
             },
         })
         joblib.dump(state, filepath)
@@ -505,12 +524,11 @@ class FactorizedVAE(BaseSynthesizer):
         scaler = torch.amp.GradScaler("cuda", enabled=self._device.type == "cuda")
 
         self.loss_values = []
-        iterator = tqdm(range(self.epochs), disable=not self.verbose)
-        for epoch in iterator:
+        for epoch in range(self.epochs):
             running = {
                 "global": 0.0, "si_skeleton": 0.0, "si_coordinates": 0.0,
                 "o_skeleton": 0.0, "o_coordinates": 0.0,
-                "cross": 0.0, "teacher_cross": 0.0,
+                "shell": 0.0, "teacher_shell": 0.0,
                 "kl": 0.0,
             }
             count = 0
@@ -633,8 +651,16 @@ class FactorizedVAE(BaseSynthesizer):
                     si_for_context = self._mix_context(si_b, si_pred, predicted_probability)
                     si_context = self.si_context_encoder(si_for_context)
 
+                    o_eps = torch.randn(
+                        z.size(0), self.o_noise_dim, device=z.device, dtype=z.dtype
+                    )
+                    z_o = (
+                        z
+                        + self.o_si_latent_encoder(si_for_context)
+                        + self.o_noise_scale * self.o_noise_encoder(o_eps)
+                    )
                     o_skel_raw, o_skel_sigma = self.o_skeleton_decoder(
-                        torch.cat([z, global_context, si_context], dim=1)
+                        torch.cat([z_o, global_context, si_context], dim=1)
                     )
                     o_skel_pred_full = _activate_transformed(
                         o_skel_raw, self.o_transformer.output_info_list
@@ -650,7 +676,7 @@ class FactorizedVAE(BaseSynthesizer):
                     o_skel_context = self.o_skeleton_context_encoder(o_skel_for_context)
 
                     o_coord_raw, o_coord_sigma = self.o_coordinate_decoder(
-                        torch.cat([z, global_context, si_context, o_skel_context], dim=1)
+                        torch.cat([z_o, global_context, si_context, o_skel_context], dim=1)
                     )
 
                     global_loss = _block_reconstruction_loss(
@@ -676,21 +702,21 @@ class FactorizedVAE(BaseSynthesizer):
                         1 + logvar - mu.pow(2) - logvar.exp()
                     ) / full_b.size(0)
 
-                    # Optional cross-sublattice coordination regularizer.
-                    cross_loss = si_coord_raw_for_geometry.sum() * 0.0
-                    teacher_cross_loss = si_coord_raw_for_geometry.sum() * 0.0
-                    if self.cross_loss_weight > 0 and self._geometry_data is not None:
-                        n_cross = min(self.cross_batch_size, full_b.size(0))
-                        cross_loss, teacher_cross_loss = self._geometry_data(
-                            row_id_b[:n_cross],
-                            global_raw[:n_cross],
-                            si_coord_raw_for_geometry[:n_cross],
-                            o_coord_raw[:n_cross],
+                    # Si-aware ordered first-shell objective.  The geometry
+                    # callback detaches the predicted cell and Si framework, so
+                    # this term updates only the oxygen coordinate pathway.
+                    shell_loss = o_coord_raw.sum() * 0.0
+                    teacher_shell_loss = o_coord_raw.sum() * 0.0
+                    if self.shell_loss_weight > 0 and self._geometry_data is not None:
+                        n_shell = min(self.shell_batch_size, full_b.size(0))
+                        shell_loss, teacher_shell_loss = self._geometry_data(
+                            row_id_b[:n_shell],
+                            global_raw[:n_shell],
+                            si_coord_raw_for_geometry[:n_shell],
+                            o_coord_raw[:n_shell],
                             self.global_transformer,
                             self.si_transformer,
                             self.o_transformer,
-                            self.cross_onset,
-                            self.cross_cutoff,
                             self._device,
                         )
                     si_loss = si_skeleton_loss + si_coordinate_loss
@@ -700,7 +726,7 @@ class FactorizedVAE(BaseSynthesizer):
                         + self.si_loss_weight * si_loss
                         + self.o_loss_weight * o_loss
                         + current_kl_weight * kl_loss
-                        + self.cross_loss_weight * cross_loss
+                        + self.shell_loss_weight * shell_loss
                     )
 
                 scaler.scale(loss).backward()
@@ -722,7 +748,7 @@ class FactorizedVAE(BaseSynthesizer):
                     ("si_coordinates", si_coordinate_loss),
                     ("o_skeleton", o_skeleton_loss),
                     ("o_coordinates", o_coordinate_loss),
-                    ("cross", cross_loss), ("teacher_cross", teacher_cross_loss),
+                    ("shell", shell_loss), ("teacher_shell", teacher_shell_loss),
                     ("kl", kl_loss),
                 ]:
                     running[key] += value.detach().item() * bsz
@@ -742,14 +768,14 @@ class FactorizedVAE(BaseSynthesizer):
                     record["o_skeleton_loss"] + record["o_coordinates_loss"]
                 )
                 + current_kl_weight * record["kl_loss"]
-                + self.cross_loss_weight * record["cross_loss"]
+                + self.shell_loss_weight * record["shell_loss"]
             )
-            iterator.set_description(
-                f"Loss {total_display:.3f} | coord {record['cross_loss']:.3f} "
-                f"(w={self.cross_loss_weight:g}) | "
-                f"Si sitewise R_i|G,W,R_<i | "
-                f"ctx {predicted_probability:.2f}"
-            )
+            if self.verbose and (epoch == 0 or (epoch + 1) % 25 == 0 or epoch + 1 == self.epochs):
+                print(
+                    f"Epoch {epoch + 1:4d}/{self.epochs} | loss {total_display:.3f} "
+                    f"| O-shell {record['shell_loss']:.3f} "
+                    f"(w={self.shell_loss_weight:g}) | ctx {predicted_probability:.2f}"
+                )
             if (epoch + 1) % 25 == 0:
                 self.save(os.path.join(
                     self.model_folder,
@@ -789,6 +815,7 @@ class FactorizedVAE(BaseSynthesizer):
         max_independent_sites=None,
         si_skeleton_feasibility=None,
         si_feasibility_topk=16,
+        generate_o=True,
     ):
         """Sample G, mask Si skeletons by stoichiometry and packing feasibility, then generate coordinates."""
         for module in self._all_modules():
@@ -817,6 +844,7 @@ class FactorizedVAE(BaseSynthesizer):
                 raise ValueError("max_independent_sites must be positive or None.")
 
         global_batches, global_realized_batches, si_batches, o_batches, valid_batches = [], [], [], [], []
+        z_batches = []
         stats = {
             "rows": 0, "invalid_space_group": 0,
             "no_compatible_si_skeleton": 0, "invalid_si_skeleton": 0,
@@ -1072,9 +1100,25 @@ class FactorizedVAE(BaseSynthesizer):
                 )
                 si_context = self.si_context_encoder(si_x)
 
+                if not generate_o:
+                    global_batches.append(global_x.cpu().numpy())
+                    si_batches.append(si_x.cpu().numpy())
+                    valid_batches.append(row_valid.cpu().numpy())
+                    z_batches.append(z.cpu().numpy())
+                    generated += current_batch
+                    continue
+
                 # Stage 4: masked O skeleton conditioned on complete Si block.
+                o_eps = torch.randn(
+                    z.size(0), self.o_noise_dim, device=z.device, dtype=z.dtype
+                )
+                z_o = (
+                    z
+                    + self.o_si_latent_encoder(si_x)
+                    + self.o_noise_scale * self.o_noise_encoder(o_eps)
+                )
                 o_skel_raw, _ = self.o_skeleton_decoder(
-                    torch.cat([z, global_context, si_context], dim=1)
+                    torch.cat([z_o, global_context, si_context], dim=1)
                 )
                 o_masks = None
                 if enforce_sio2_multiplicity:
@@ -1120,7 +1164,7 @@ class FactorizedVAE(BaseSynthesizer):
 
                 # Stage 5: O coordinates conditioned on the sampled O skeleton.
                 o_coord_raw, _ = self.o_coordinate_decoder(
-                    torch.cat([z, global_context, si_context, o_skel_context], dim=1)
+                    torch.cat([z_o, global_context, si_context, o_skel_context], dim=1)
                 )
                 o_coord_x = _activate_transformed(
                     o_coord_raw, self.o_transformer.output_info_list,
@@ -1138,8 +1182,30 @@ class FactorizedVAE(BaseSynthesizer):
 
         global_array = np.concatenate(global_batches, axis=0)[:samples]
         si_array = np.concatenate(si_batches, axis=0)[:samples]
-        o_array = np.concatenate(o_batches, axis=0)[:samples]
         valid_mask = np.concatenate(valid_batches, axis=0)[:samples]
+        if not generate_o:
+            stats["rows"] = int(samples)
+            global_df = pd.concat(
+                global_realized_batches, ignore_index=True
+            ).iloc[:samples].reset_index(drop=True)
+            si_inverse_sigma = self._combined_si_sigma((si_st, si_ed)).copy()
+            for site in range(self.n_si_sites):
+                for st_site, ed_site in self.si_site_spans[site]:
+                    si_inverse_sigma[st_site:ed_site] = 0.0
+            si_df = self.si_transformer.inverse_transform(
+                si_array, si_inverse_sigma
+            )
+            return {
+                "z": np.concatenate(z_batches, axis=0)[:samples],
+                "global_x": global_array,
+                "si_x": si_array,
+                "global_df": global_df,
+                "si_df": si_df,
+                "valid_mask": valid_mask,
+                "stats": stats,
+                "max_independent_sites": max_independent_sites,
+            }
+        o_array = np.concatenate(o_batches, axis=0)[:samples]
         stats["rows"] = int(samples)
 
         # Use the exact noisy G realization already seen by the Si chemistry
@@ -1168,6 +1234,153 @@ class FactorizedVAE(BaseSynthesizer):
             ),
         )
         return global_df, si_df, o_df, valid_mask, stats
+
+
+    def sample_si(self, samples, **kwargs):
+        """Sample only G and Si; oxygen is deliberately deferred."""
+        kwargs.pop("generate_o", None)
+        return self.sample(samples, generate_o=False, **kwargs)
+
+    def o_adapter_context(self, si_state):
+        """Return the frozen complete-Si latent context used by the OTF adapter."""
+        for module in self._all_modules():
+            module.eval()
+        sx0 = np.asarray(si_state["si_x"], dtype=np.float32)
+        with torch.no_grad():
+            si_x = torch.as_tensor(sx0, device=self._device)
+            context = self.o_si_latent_encoder(si_x)
+        return context.cpu().numpy().astype(np.float32, copy=False)
+
+    def sample_o_from_si(
+        self,
+        si_state,
+        proposals_per_si=1,
+        temperature=1.0,
+        hard=True,
+        enforce_sio2_multiplicity=True,
+        max_independent_sites=None,
+        o_noise=None,
+    ):
+        """Generate independent O proposals for fixed sampled G/Si frameworks.
+
+        The G and Si tensors are repeated unchanged.  Only oxygen-specific
+        latent noise is resampled, so proposals remain conditional on exactly
+        the same confirmed Si framework.
+        """
+        for module in self._all_modules():
+            module.eval()
+        k = max(1, int(proposals_per_si))
+        z0 = np.asarray(si_state["z"], dtype=np.float32)
+        gx0 = np.asarray(si_state["global_x"], dtype=np.float32)
+        sx0 = np.asarray(si_state["si_x"], dtype=np.float32)
+        nparent = len(z0)
+        if not (len(gx0) == len(sx0) == nparent):
+            raise ValueError("Fixed-Si state arrays have inconsistent lengths.")
+        parent = np.repeat(np.arange(nparent, dtype=int), k)
+        z = torch.as_tensor(z0[parent], device=self._device)
+        global_x = torch.as_tensor(gx0[parent], device=self._device)
+        si_x = torch.as_tensor(sx0[parent], device=self._device)
+        global_df_parent = si_state["global_df"].reset_index(drop=True)
+        si_df_parent = si_state["si_df"].reset_index(drop=True)
+
+        o_st, o_ed, o_categories = _get_discrete_span_and_categories(
+            self.o_transformer, "o_skeleton_token"
+        )
+        si_st, si_ed, si_categories = _get_discrete_span_and_categories(
+            self.si_transformer, "si_skeleton_token"
+        )
+        parsed_o = [_parse_wp_token(token) for token in o_categories]
+        parsed_si = [_parse_wp_token(token) for token in si_categories]
+        si_counts = [sum(wp >= 0 for wp in token) for token in parsed_si]
+        o_counts = [sum(wp >= 0 for wp in token) for token in parsed_o]
+        group_cache = {}
+        valid = torch.ones(len(parent), dtype=torch.bool, device=self._device)
+
+        with torch.no_grad():
+            global_context = self.global_context_encoder(global_x)
+            si_context = self.si_context_encoder(si_x)
+            if o_noise is None:
+                eps = torch.randn(
+                    len(parent), self.o_noise_dim, device=self._device, dtype=z.dtype
+                )
+            else:
+                noise_array = np.asarray(o_noise, dtype=np.float32)
+                expected = (len(parent), self.o_noise_dim)
+                if noise_array.shape != expected:
+                    raise ValueError(
+                        f"o_noise shape {noise_array.shape} does not match {expected}."
+                    )
+                eps = torch.as_tensor(noise_array, device=self._device, dtype=z.dtype)
+            z_o = (
+                z
+                + self.o_si_latent_encoder(si_x)
+                + self.o_noise_scale * self.o_noise_encoder(eps)
+            )
+            o_skel_raw, _ = self.o_skeleton_decoder(
+                torch.cat([z_o, global_context, si_context], dim=1)
+            )
+            masks = None
+            if enforce_sio2_multiplicity:
+                allowed = torch.zeros(
+                    len(parent), len(o_categories), dtype=torch.bool, device=self._device
+                )
+                si_ids = torch.argmax(si_x[:, si_st:si_ed], dim=1).cpu().tolist()
+                for row, (pid, si_id) in enumerate(zip(parent.tolist(), si_ids)):
+                    try:
+                        spg = int(round(float(global_df_parent.iloc[pid]["spg"])))
+                        if spg not in group_cache:
+                            group = Group(spg)
+                            group_cache[spg] = [
+                                int(group[i].multiplicity) for i in range(len(group))
+                            ]
+                        mult = group_cache[spg]
+                        si_wps = [wp for wp in parsed_si[si_id] if wp >= 0]
+                        n_si = sum(mult[wp] for wp in si_wps)
+                        for oid, token in enumerate(parsed_o):
+                            owps = [wp for wp in token if wp >= 0]
+                            if not owps or any(wp >= len(mult) for wp in owps):
+                                continue
+                            if max_independent_sites is not None and (
+                                si_counts[si_id] + o_counts[oid] > int(max_independent_sites)
+                            ):
+                                continue
+                            if sum(mult[wp] for wp in owps) == 2 * n_si:
+                                allowed[row, oid] = True
+                    except Exception:
+                        valid[row] = False
+                    if not bool(allowed[row].any()):
+                        valid[row] = False
+                        allowed[row, 0] = True
+                masks = {(o_st, o_ed): allowed}
+            o_skel = _activate_transformed(
+                o_skel_raw, self.o_transformer.output_info_list,
+                temperature=temperature, hard=hard, categorical_masks=masks
+            )
+            o_skel_only = torch.zeros_like(o_skel)
+            o_skel_only[:, o_st:o_ed] = o_skel[:, o_st:o_ed]
+            o_skel_context = self.o_skeleton_context_encoder(o_skel_only)
+            o_coord_raw, _ = self.o_coordinate_decoder(
+                torch.cat([z_o, global_context, si_context, o_skel_context], dim=1)
+            )
+            o_coord = _activate_transformed(
+                o_coord_raw, self.o_transformer.output_info_list,
+                temperature=temperature, hard=hard
+            )
+            o_x = _merge_skeleton_and_coordinates(o_skel, o_coord, (o_st, o_ed))
+        o_df = self.o_transformer.inverse_transform(
+            o_x.cpu().numpy(),
+            self._combined_sigma(
+                self.o_skeleton_decoder, self.o_coordinate_decoder, (o_st, o_ed)
+            ),
+        )
+        return {
+            "parent": parent,
+            "o_df": o_df,
+            "valid_mask": valid.cpu().numpy(),
+            "global_df": global_df_parent.iloc[parent].reset_index(drop=True),
+            "si_df": si_df_parent.iloc[parent].reset_index(drop=True),
+            "o_noise": eps.detach().cpu().numpy().astype(np.float32, copy=False),
+        }
 
     def set_device(self, device):
         self._device = torch.device(device)
