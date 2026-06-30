@@ -26,24 +26,25 @@ def build_output_filename(output_dir, tag, discrete, discrete_cell):
     return os.path.join(output_dir, f"{tag}{suffix}")
 
 
-def make_builder(
-    prototype_cn3="graphite",
-    prototype_cn4="diamond",
-    rcut=2.0,
-):
-    """Create a carbon builder with site-specific CN3/CN4 references."""
-    reference_cn3 = pyxtal()
-    reference_cn3.from_prototype(prototype_cn3)
+def assign_sio2_templates(xtal):
+    """Assign fixed tetrahedral-silica coordination targets by species."""
+    targets = {"Si": 4, "O": 2}
+    for site in xtal.atom_sites:
+        if site.specie not in targets:
+            raise ValueError(
+                f"Unsupported species {site.specie!r}; expected only Si and O."
+            )
+        site.set_target_coordination(targets[site.specie])
 
-    reference_cn4 = pyxtal()
-    reference_cn4.from_prototype(prototype_cn4)
 
-    bu = builder(["C"], [1], verbose=False)
+def make_builder(reference_sio2, rcut=2.4):
+    """Create a SiO2 builder with species-specific SO3 references."""
+    bu = builder(["Si", "O"], [1, 2], verbose=False)
     bu.set_descriptor_calculator(mykwargs={"rcut": rcut})
     bu.set_target_coordination_references(
         {
-            3: reference_cn3.to_pymatgen(),
-            4: reference_cn4.to_pymatgen(),
+            ("Si", 4): reference_sio2,
+            ("O", 2): reference_sio2,
         }
     )
     return bu
@@ -213,14 +214,13 @@ def get_reps_from_xtal(xtal, params):
         discrete_cell,
         discrete_resolution,
         subgroup_eps,
-        prototype_cn3,
-        prototype_cn4,
+        reference_sio2,
         rcut,
     ) = params
 
+    assign_sio2_templates(xtal)
     bu = make_builder(
-        prototype_cn3=prototype_cn3,
-        prototype_cn4=prototype_cn4,
+        reference_sio2=reference_sio2,
         rcut=rcut,
     )
     xtal_reps = []
@@ -413,7 +413,7 @@ def parse_args():
 
     parser.add_argument(
         "--database",
-        default="data/source/sp2_sacada.db",
+        default="data/source/sio2.db",
         help="Input PyXtal database.",
     )
     parser.add_argument(
@@ -519,14 +519,12 @@ def parse_args():
         help="Base random seed.",
     )
     parser.add_argument(
-        "--prototype-cn3",
-        default="graphite",
-        help="Prototype defining the target-CN3 SO3 environment.",
-    )
-    parser.add_argument(
-        "--prototype-cn4",
-        default="diamond",
-        help="Prototype defining the target-CN4 SO3 environment.",
+        "--reference-sio2",
+        required=True,
+        help=(
+            "Reference tetrahedral SiO2 CIF used to extract both the "
+            "Si(CN4) and O(CN2) SO3 environments."
+        ),
     )
 
     return parser.parse_args()
@@ -553,7 +551,7 @@ def main():
 
     if not args.target_coordination:
         raise ValueError(
-            "This mixed-coordination workflow requires "
+            "This coordination-aware workflow requires "
             "--target-coordination."
         )
 
@@ -605,9 +603,8 @@ def main():
         f"(resolution: {discrete_resolution})"
     )
     print(f"Discrete cell: {args.discrete_cell}")
-    print(f"CN3 reference prototype: {args.prototype_cn3}")
-    print(f"CN4 reference prototype: {args.prototype_cn4}")
-    print("Coordination criterion: per-site target_coordination")
+    print(f"SiO2 reference: {args.reference_sio2}")
+    print("Coordination templates: Si->O4; O->Si2")
     print(f"SO3 cutoff: {args.rcut}")
     print(f"CPU processes: {args.ncpu}")
     print(f"Multiprocessing chunksize: {args.chunksize}")
@@ -652,8 +649,7 @@ def main():
         args.discrete_cell,
         discrete_resolution,
         5e-4,
-        args.prototype_cn3,
-        args.prototype_cn4,
+        args.reference_sio2,
         args.rcut,
     )
 
@@ -759,5 +755,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
