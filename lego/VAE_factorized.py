@@ -1,5 +1,11 @@
 """Factorized tabular VAE for binary LEGO-Xtal representations.
 
+Chemistry-specific multiplicity masking is controlled by an explicit
+(center, sublattice) composition ratio. Internal ``si``/``o`` tensor names are
+retained because the runtime driver and saved transformer layout use them as
+standard block names; they denote the first/building-center and second
+sublattice blocks, respectively.
+
 The decoder is explicitly sequential:
     global       = D_global(z)
     Si skeleton  = D_Si_skel(z, global_context)
@@ -261,7 +267,7 @@ def _selected_reconstruction_loss(
     return sum(terms) * factor / x.size(0)
 
 class FactorizedVAE(BaseSynthesizer):
-    """Factorized VAE with chemistry-aware Si Wyckoff feasibility masking."""
+    """Factorized VAE with chemistry-aware center Wyckoff feasibility masking."""
 
     def __init__(
         self,
@@ -280,8 +286,6 @@ class FactorizedVAE(BaseSynthesizer):
         kl_warmup_epochs=0,
         predicted_context_start=0.0,
         predicted_context_end=0.8,
-        shell_loss_weight=1.0,
-        shell_batch_size=16,
         o_noise_dim=32,
         o_noise_scale=1.0,
         cuda=True,
@@ -303,8 +307,6 @@ class FactorizedVAE(BaseSynthesizer):
         self.kl_warmup_epochs = kl_warmup_epochs
         self.predicted_context_start = predicted_context_start
         self.predicted_context_end = predicted_context_end
-        self.shell_loss_weight = float(shell_loss_weight)
-        self.shell_batch_size = int(shell_batch_size)
         self.o_noise_dim = int(o_noise_dim)
         self.o_noise_scale = float(o_noise_scale)
         self.verbose = verbose
@@ -432,9 +434,9 @@ class FactorizedVAE(BaseSynthesizer):
                 "oxygen_sampling": "fixed_si_error_conditioned_otf_adapter",
                 "o_noise_dim": self.o_noise_dim,
                 "o_noise_scale": self.o_noise_scale,
-                "sampling_selector": "si_nn_then_o_d1_d4_d5_d1_d2_d3",
+                "sampling_selector": "center_nn_then_sublattice_local_density",
                 "si_coordinate_mode": "sitewise_autoregressive",
-                "si_skeleton_conditioning": "multiplicity_mask_only",
+                "center_skeleton_conditioning": "composition_multiplicity_mask_only",
                 "si_coordinate_conditioning": "sitewise_autoregressive",
                 "o_skeleton_conditioning": "global_plus_complete_si",
                 "o_coordinate_conditioning": "global_plus_complete_si_plus_o_skeleton",
@@ -462,7 +464,6 @@ class FactorizedVAE(BaseSynthesizer):
         global_discrete_columns=(),
         si_discrete_columns=(),
         o_discrete_columns=(),
-        geometry_data=None,
     ):
         if not (len(global_data) == len(si_data) == len(o_data)):
             raise ValueError("Global, Si, and O blocks must have equal row counts.")
@@ -516,7 +517,6 @@ class FactorizedVAE(BaseSynthesizer):
             torch.from_numpy(o_x).to(self._device),
             row_ids,
         )
-        self._geometry_data = geometry_data
         loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True, drop_last=False)
 
         parameters = [p for module in self._all_modules() for p in module.parameters()]
@@ -528,7 +528,6 @@ class FactorizedVAE(BaseSynthesizer):
             running = {
                 "global": 0.0, "si_skeleton": 0.0, "si_coordinates": 0.0,
                 "o_skeleton": 0.0, "o_coordinates": 0.0,
-                "shell": 0.0, "teacher_shell": 0.0,
                 "kl": 0.0,
             }
             count = 0
@@ -702,23 +701,6 @@ class FactorizedVAE(BaseSynthesizer):
                         1 + logvar - mu.pow(2) - logvar.exp()
                     ) / full_b.size(0)
 
-                    # Si-aware ordered first-shell objective.  The geometry
-                    # callback detaches the predicted cell and Si framework, so
-                    # this term updates only the oxygen coordinate pathway.
-                    shell_loss = o_coord_raw.sum() * 0.0
-                    teacher_shell_loss = o_coord_raw.sum() * 0.0
-                    if self.shell_loss_weight > 0 and self._geometry_data is not None:
-                        n_shell = min(self.shell_batch_size, full_b.size(0))
-                        shell_loss, teacher_shell_loss = self._geometry_data(
-                            row_id_b[:n_shell],
-                            global_raw[:n_shell],
-                            si_coord_raw_for_geometry[:n_shell],
-                            o_coord_raw[:n_shell],
-                            self.global_transformer,
-                            self.si_transformer,
-                            self.o_transformer,
-                            self._device,
-                        )
                     si_loss = si_skeleton_loss + si_coordinate_loss
                     o_loss = o_skeleton_loss + o_coordinate_loss
                     loss = (
@@ -726,7 +708,6 @@ class FactorizedVAE(BaseSynthesizer):
                         + self.si_loss_weight * si_loss
                         + self.o_loss_weight * o_loss
                         + current_kl_weight * kl_loss
-                        + self.shell_loss_weight * shell_loss
                     )
 
                 scaler.scale(loss).backward()
@@ -748,7 +729,6 @@ class FactorizedVAE(BaseSynthesizer):
                     ("si_coordinates", si_coordinate_loss),
                     ("o_skeleton", o_skeleton_loss),
                     ("o_coordinates", o_coordinate_loss),
-                    ("shell", shell_loss), ("teacher_shell", teacher_shell_loss),
                     ("kl", kl_loss),
                 ]:
                     running[key] += value.detach().item() * bsz
@@ -768,13 +748,11 @@ class FactorizedVAE(BaseSynthesizer):
                     record["o_skeleton_loss"] + record["o_coordinates_loss"]
                 )
                 + current_kl_weight * record["kl_loss"]
-                + self.shell_loss_weight * record["shell_loss"]
             )
             if self.verbose and (epoch == 0 or (epoch + 1) % 25 == 0 or epoch + 1 == self.epochs):
                 print(
                     f"Epoch {epoch + 1:4d}/{self.epochs} | loss {total_display:.3f} "
-                    f"| O-shell {record['shell_loss']:.3f} "
-                    f"(w={self.shell_loss_weight:g}) | ctx {predicted_probability:.2f}"
+                    f"| ctx {predicted_probability:.2f}"
                 )
             if (epoch + 1) % 25 == 0:
                 self.save(os.path.join(
@@ -811,13 +789,20 @@ class FactorizedVAE(BaseSynthesizer):
         samples,
         temperature=1.0,
         hard=True,
-        enforce_sio2_multiplicity=True,
+        enforce_composition_multiplicity=True,
+        composition_ratio=(1, 2),
         max_independent_sites=None,
         si_skeleton_feasibility=None,
         si_feasibility_topk=16,
         generate_o=True,
     ):
-        """Sample G, mask Si skeletons by stoichiometry and packing feasibility, then generate coordinates."""
+        """Sample G, apply composition/slot masks, then generate coordinates."""
+        try:
+            center_coeff, sublattice_coeff = (int(composition_ratio[0]), int(composition_ratio[1]))
+        except (TypeError, ValueError, IndexError) as exc:
+            raise ValueError("composition_ratio must contain two positive integers.") from exc
+        if center_coeff <= 0 or sublattice_coeff <= 0:
+            raise ValueError("composition_ratio must contain two positive integers.")
         for module in self._all_modules():
             module.eval()
 
@@ -903,7 +888,7 @@ class FactorizedVAE(BaseSynthesizer):
                     torch.cat([z, global_context], dim=1)
                 )
                 si_masks = None
-                if enforce_sio2_multiplicity:
+                if enforce_composition_multiplicity:
                     si_allowed = torch.zeros(
                         current_batch, len(si_categories), dtype=torch.bool,
                         device=self._device,
@@ -925,7 +910,7 @@ class FactorizedVAE(BaseSynthesizer):
                                     si_counts[si_id] + o_counts[o_id] > max_independent_sites
                                 ):
                                     continue
-                                if sum(mult[wp] for wp in o_wps) == 2 * n_si:
+                                if center_coeff * sum(mult[wp] for wp in o_wps) == sublattice_coeff * n_si:
                                     si_allowed[row, si_id] = True
                                     break
                         if not bool(si_allowed[row].any()):
@@ -1121,7 +1106,7 @@ class FactorizedVAE(BaseSynthesizer):
                     torch.cat([z_o, global_context, si_context], dim=1)
                 )
                 o_masks = None
-                if enforce_sio2_multiplicity:
+                if enforce_composition_multiplicity:
                     si_ids = torch.argmax(si_x[:, si_st:si_ed], dim=1).cpu().tolist()
                     o_allowed = torch.zeros(
                         current_batch, len(o_categories), dtype=torch.bool,
@@ -1146,7 +1131,7 @@ class FactorizedVAE(BaseSynthesizer):
                                 si_counts[si_id] + o_counts[o_id] > max_independent_sites
                             ):
                                 continue
-                            if sum(mult[wp] for wp in o_wps) == 2 * n_si:
+                            if center_coeff * sum(mult[wp] for wp in o_wps) == sublattice_coeff * n_si:
                                 o_allowed[row, o_id] = True
                         if not bool(o_allowed[row].any()):
                             row_valid[row] = False
@@ -1257,16 +1242,22 @@ class FactorizedVAE(BaseSynthesizer):
         proposals_per_si=1,
         temperature=1.0,
         hard=True,
-        enforce_sio2_multiplicity=True,
+        enforce_composition_multiplicity=True,
+        composition_ratio=(1, 2),
         max_independent_sites=None,
         o_noise=None,
     ):
-        """Generate independent O proposals for fixed sampled G/Si frameworks.
+        """Generate sublattice proposals for fixed sampled center frameworks.
 
-        The G and Si tensors are repeated unchanged.  Only oxygen-specific
-        latent noise is resampled, so proposals remain conditional on exactly
-        the same confirmed Si framework.
+        The global and center tensors are repeated unchanged. Only
+        sublattice-specific latent noise is resampled.
         """
+        try:
+            center_coeff, sublattice_coeff = (int(composition_ratio[0]), int(composition_ratio[1]))
+        except (TypeError, ValueError, IndexError) as exc:
+            raise ValueError("composition_ratio must contain two positive integers.") from exc
+        if center_coeff <= 0 or sublattice_coeff <= 0:
+            raise ValueError("composition_ratio must contain two positive integers.")
         for module in self._all_modules():
             module.eval()
         k = max(1, int(proposals_per_si))
@@ -1320,7 +1311,7 @@ class FactorizedVAE(BaseSynthesizer):
                 torch.cat([z_o, global_context, si_context], dim=1)
             )
             masks = None
-            if enforce_sio2_multiplicity:
+            if enforce_composition_multiplicity:
                 allowed = torch.zeros(
                     len(parent), len(o_categories), dtype=torch.bool, device=self._device
                 )
@@ -1344,7 +1335,7 @@ class FactorizedVAE(BaseSynthesizer):
                                 si_counts[si_id] + o_counts[oid] > int(max_independent_sites)
                             ):
                                 continue
-                            if sum(mult[wp] for wp in owps) == 2 * n_si:
+                            if center_coeff * sum(mult[wp] for wp in owps) == sublattice_coeff * n_si:
                                 allowed[row, oid] = True
                     except Exception:
                         valid[row] = False

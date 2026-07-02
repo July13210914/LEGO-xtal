@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
-"""Train and sample a factorized SiO2 LEGO-Xtal VAE.
+"""Train and sample a factorized TiO2 LEGO-Xtal VAE.
 
-This version confirms the Si framework first, then constructs oxygen one
+This version confirms the Ti framework first, then constructs oxygen one
 Wyckoff orbit at a time using a narrowed pooled Si--O/O--O ionic probability
 field. Cached Sobol orbit pools concentrate exact
 search inside promising free-parameter regions while retaining exploration.  The decoder stages are:
     global:       space group and cell
-    Si skeleton:  Si Wyckoff occupancy pattern
-    Si parameters: site-wise free parameters conditioned on G, Si skeleton, and prior Si sites
-    O skeleton:   O Wyckoff occupancy conditioned on the complete Si block
+    Ti skeleton:  Ti Wyckoff occupancy pattern
+    Ti parameters: site-wise free parameters conditioned on G, Ti skeleton, and prior Ti sites
+    O skeleton:   O Wyckoff occupancy conditioned on the complete Ti block
     O parameters: free Wyckoff parameters conditioned on sampled O skeleton
 
 The sampled free parameters are mapped deterministically through PyXtal to exact
 Wyckoff generating coordinates before the standard LEGO CSV is written.
 Sampling applies hard space-group, stoichiometry, and slot-capacity masks.
-Confirmed Si frameworks are dispatched one per CPU task to a dynamically
+Confirmed Ti frameworks are dispatched one per CPU task to a dynamically
 scheduled manager-worker pool for cached ionic-field oxygen construction.
 """
 
@@ -36,8 +36,12 @@ from pyxtal.symmetry import Group
 
 
 BASE_COLUMNS = ["spg", "a", "b", "c", "alpha", "beta", "gamma"]
-SI_CN = 4
-O_CN = 2
+# Legacy ``si_*`` names denote the factorized center block.  For this
+# TiO2 workflow, that block contains Ti sites; retaining the names avoids a
+# representation and checkpoint migration.
+SI_CN = 6
+O_CN = 3
+DEFAULT_COMPOSITION_RATIO = (1, 2)
 
 
 def find_indexed_columns(columns, prefix):
@@ -70,7 +74,7 @@ def validate_layout(df):
 
 
 def canonicalize_species_order(df, num_wps):
-    """Reorder each row as all CN4 sites, then all CN2 sites, then padding."""
+    """Reorder each row as all Ti/CN6 sites, then O/CN3 sites, then padding."""
     output = df.copy()
     allowed = {0, SI_CN, O_CN}
     n_si_max = 0
@@ -87,7 +91,7 @@ def canonicalize_species_order(df, num_wps):
             if cn not in allowed:
                 raise ValueError(
                     f"Row {row_index}, slot {i}: unsupported target_coord={cn}; "
-                    "factorized SiO2 v1 expects only 4, 2, or 0."
+                    "factorized TiO2 expects only 6, 3, or 0."
                 )
             if wp == -1:
                 if cn != 0:
@@ -106,7 +110,7 @@ def canonicalize_species_order(df, num_wps):
 
         if not si_sites or not o_sites:
             raise ValueError(
-                f"Row {row_index} lacks one species: n_Si={len(si_sites)}, n_O={len(o_sites)}"
+                f"Row {row_index} lacks one species: n_Ti={len(si_sites)}, n_O={len(o_sites)}"
             )
         n_si_max = max(n_si_max, len(si_sites))
         n_o_max = max(n_o_max, len(o_sites))
@@ -203,6 +207,8 @@ def _wyckoff_position_from_parameters(spg, wp_index, parameters):
 
 def build_factorized_blocks(df, num_wps, n_si_max, n_o_max):
     """Build global/species blocks using free Wyckoff parameters.
+
+    Internal ``si_*`` columns store the Ti center block for compatibility.
 
     The three continuous columns per site are retained for compatibility with
     the existing VAE block layout, but they now mean ``u0,u1,u2``. Unused
@@ -966,11 +972,11 @@ def combine_prepared_species(batch_df, si_prepared, o_prepared=None):
 
 
 class OnlineOxygenFirstShellSelector:
-    """Online empirical population matching for the SiO4/OSi2 first shell.
+    """Online empirical population matching for the TiO6/OTi3 first shell.
 
     Six marginal order-statistic populations are matched simultaneously:
     Si->O d1/d4/d5 and O->Si d1/d2/d3.  All are extracted from one exact
-    27-image batched Si-O distance matrix.  No angular or second-shell target
+    27-image batched Ti-O distance matrix.  No angular or second-shell target
     is used; d5 and d3 only mark the first unwanted neighbour.
     """
 
@@ -1000,7 +1006,7 @@ class OnlineOxygenFirstShellSelector:
         self.cn_both = []
         training_desc = self.describe(training_prepared, update_raw=False)
         if not training_desc:
-            raise RuntimeError("No valid training Si-O first-shell environments.")
+            raise RuntimeError("No valid training Ti-O first-shell environments.")
         values = {name: [] for name in self.METRICS}
         nsi, no = [], []
         for item in training_desc:
@@ -1364,7 +1370,7 @@ class OnlineOConditionalAdapter(torch.nn.Module):
 
 
 class OnlinePerSiNearestNeighborSelector:
-    """Match the accepted population of per-Si nearest-neighbour distances.
+    """Match the accepted population of per-Ti nearest-neighbour distances.
 
     Every symmetry-expanded Si atom contributes exactly one periodic nearest-
     neighbour distance.  The target is a Gaussian fitted to the complete
@@ -1424,7 +1430,7 @@ class OnlinePerSiNearestNeighborSelector:
             except Exception:
                 skipped += 1
         if not training_values:
-            raise RuntimeError("No valid per-Si nearest-neighbour training environments.")
+            raise RuntimeError("No valid per-Ti nearest-neighbour training environments.")
 
         self.training_values = np.asarray(training_values, dtype=float)
         self.training_structures = len(nsi)
@@ -1689,7 +1695,7 @@ def _expand_o_orbit(spg, wp_index, free_parameters):
 class PooledIonicDistanceTarget:
     """Two narrowed ionic-distance distributions used for O construction.
 
-    Si--O pools Si->O1..O4 and O->Si1..Si2 into one distribution.
+    Ti--O pools Ti->O1..O6 and O->Ti1..Ti3 into one distribution.
     O--O uses the nearest periodic O neighbour for each O atom.  Both are fit
     by Gaussians whose widths are intentionally compressed relative to the
     measured training widths, suppressing elongated and diffuse environments.
@@ -1768,8 +1774,10 @@ class PooledIonicDistanceTarget:
         dist = _periodic_cross_distances_numpy(si_frac, o_frac, cell)
         si_all = np.sort(dist.reshape(len(si_frac), -1), axis=1)
         o_all = np.sort(np.transpose(dist, (1, 0, 2)).reshape(len(o_frac), -1), axis=1)
-        sio_parts = [si_all[:, :min(4, si_all.shape[1])].reshape(-1),
-                     o_all[:, :min(2, o_all.shape[1])].reshape(-1)]
+        sio_parts = [
+            si_all[:, :min(SI_CN, si_all.shape[1])].reshape(-1),
+            o_all[:, :min(O_CN, o_all.shape[1])].reshape(-1),
+        ]
         sio = np.concatenate(sio_parts)
         oo = cls._oo_nearest(o_frac, cell)
         return {"sio": sio[np.isfinite(sio)], "oo": oo[np.isfinite(oo)]}
@@ -1840,6 +1848,546 @@ class PooledIonicDistanceTarget:
             else:
                 out[name] = {k: float("nan") for k in ("mean","std","q05","q50","q95","tv")}
         return out
+
+
+
+
+class TiO2IntegrityEvaluator:
+    """Periodic TiO6/OTi3 integrity gate and topology-quality descriptor."""
+
+    def __init__(self, max_ti_o=2.6, max_o_ti=2.6, max_angle_rms=22.0,
+                 min_ti_pass_fraction=1.0, min_o_pass_fraction=1.0):
+        self.max_ti_o = float(max_ti_o)
+        self.max_o_ti = float(max_o_ti)
+        self.max_angle_rms = float(max_angle_rms)
+        self.min_ti_pass_fraction = float(min_ti_pass_fraction)
+        self.min_o_pass_fraction = float(min_o_pass_fraction)
+        self.checked = 0
+        self.valid = 0
+        self.records = []
+
+    @staticmethod
+    def _angle_rms(vectors):
+        vectors = np.asarray(vectors, dtype=float)
+        norms = np.linalg.norm(vectors, axis=1)
+        if len(vectors) != 6 or np.any(norms <= 1.0e-10):
+            return float("inf")
+        unit = vectors / norms[:, None]
+        angles = []
+        for i in range(6):
+            for j in range(i + 1, 6):
+                cosine = float(np.clip(np.dot(unit[i], unit[j]), -1.0, 1.0))
+                angles.append(np.degrees(np.arccos(cosine)))
+        observed = np.sort(np.asarray(angles, dtype=float))
+        ideal = np.sort(np.asarray([90.0] * 12 + [180.0] * 3, dtype=float))
+        return float(np.sqrt(np.mean((observed - ideal) ** 2)))
+
+    def evaluate(self, ti_frac, o_frac, cell):
+        ti = np.asarray(ti_frac, dtype=float).reshape(-1, 3)
+        oxygen = np.asarray(o_frac, dtype=float).reshape(-1, 3)
+        cell = np.asarray(cell, dtype=float).reshape(3, 3)
+        if len(ti) == 0 or len(oxygen) == 0:
+            raise ValueError("Empty Ti or O sublattice in integrity evaluation.")
+
+        shifts = np.asarray(
+            [[i, j, k] for i in (-1, 0, 1)
+             for j in (-1, 0, 1) for k in (-1, 0, 1)],
+            dtype=float,
+        )
+        delta = ti[:, None, None, :] - oxygen[None, :, None, :] + shifts[None, None, :, :]
+        vectors = np.einsum("...i,ij->...j", delta, cell)
+        distances = np.linalg.norm(vectors, axis=-1)
+
+        ti_flat_d = distances.reshape(len(ti), -1)
+        ti_flat_v = vectors.reshape(len(ti), -1, 3)
+        if ti_flat_d.shape[1] < 6:
+            raise ValueError("Fewer than six periodic O neighbours are available per Ti.")
+        ti_order = np.argsort(ti_flat_d, axis=1)[:, :6]
+        ti_sixth = np.take_along_axis(ti_flat_d, ti_order, axis=1)[:, 5]
+        angle_rms = np.asarray([
+            self._angle_rms(ti_flat_v[i, ti_order[i]]) for i in range(len(ti))
+        ], dtype=float)
+        ti_site_pass = (ti_sixth <= self.max_ti_o) & (angle_rms <= self.max_angle_rms)
+
+        o_flat_d = np.transpose(distances, (1, 0, 2)).reshape(len(oxygen), -1)
+        if o_flat_d.shape[1] < 3:
+            raise ValueError("Fewer than three periodic Ti neighbours are available per O.")
+        o_third = np.sort(o_flat_d, axis=1)[:, 2]
+        o_site_pass = o_third <= self.max_o_ti
+
+        ti_pass_fraction = float(np.mean(ti_site_pass))
+        o_pass_fraction = float(np.mean(o_site_pass))
+        valid = bool(
+            ti_pass_fraction >= self.min_ti_pass_fraction
+            and o_pass_fraction >= self.min_o_pass_fraction
+        )
+        reasons = []
+        if ti_pass_fraction < self.min_ti_pass_fraction:
+            reasons.append(
+                f"TiO6 pass fraction {ti_pass_fraction:.3f} < {self.min_ti_pass_fraction:.3f}"
+            )
+        if o_pass_fraction < self.min_o_pass_fraction:
+            reasons.append(
+                f"OTi3 pass fraction {o_pass_fraction:.3f} < {self.min_o_pass_fraction:.3f}"
+            )
+
+        topology_loss = (
+            0.50 * float(np.mean(angle_rms)) / max(self.max_angle_rms, 1.0e-12)
+            + 0.25 * float(np.mean(ti_sixth)) / max(self.max_ti_o, 1.0e-12)
+            + 0.25 * float(np.mean(o_third)) / max(self.max_o_ti, 1.0e-12)
+        )
+        result = {
+            "integrity_valid": valid,
+            "integrity_failure_reasons": "; ".join(reasons),
+            "ti_o6_pass_fraction": ti_pass_fraction,
+            "o_ti3_pass_fraction": o_pass_fraction,
+            "ti_o_6th_max_A": float(np.max(ti_sixth)),
+            "ti_o_6th_mean_A": float(np.mean(ti_sixth)),
+            "o_ti_3rd_max_A": float(np.max(o_third)),
+            "o_ti_3rd_mean_A": float(np.mean(o_third)),
+            "tio6_angle_rms_max_deg": float(np.max(angle_rms)),
+            "tio6_angle_rms_mean_deg": float(np.mean(angle_rms)),
+            "topology_loss": float(topology_loss),
+        }
+        self.checked += 1
+        self.valid += int(valid)
+        return result
+
+    def record(self, sample_round, parent_index, decision, descriptor):
+        self.records.append({
+            "sample_round": int(sample_round),
+            "parent_index": int(parent_index),
+            "pool_action": decision,
+            **descriptor,
+        })
+
+
+class FixedCapacityDistributionPool:
+    """Fixed-size ensemble with progress-adaptive distribution optimization.
+
+    Complete geometry-valid candidates fill the pool without a distribution
+    gate. Fill-phase workload remains fixed near completion rather than shrinking
+    with the number of empty pool slots.  After filling, exact leave-one-out replacement minimizes a
+    normalized three-component objective (Ti--Ti NN, Ti--O, and O--O).
+    Component weights follow the unresolved relative error, with round-wise
+    smoothing.  Percentage guards prevent a swap from damaging any component
+    excessively, while replacement tolerance and convergence scale with the
+    current normalized progress.
+    """
+
+    COMPONENTS = ("nn", "sio", "oo")
+
+    def __init__(
+        self,
+        capacity,
+        density_selector,
+        ionic_target,
+        weight_exponent=1.0,
+        weight_floor=0.10,
+        weight_smoothing=0.20,
+        guard_min_fraction=0.05,
+        guard_max_fraction=0.20,
+        guard_absolute_floor=0.002,
+        replacement_relative_tolerance=1.0e-3,
+        replacement_absolute_floor=1.0e-5,
+        convergence_window_sqrt_factor=50.0,
+        convergence_window_min=500,
+        convergence_window_max=5000,
+        convergence_relative_gain=1.0e-2,
+        convergence_max_swap_fraction=2.0e-3,
+        convergence_max_swaps_floor=2,
+        minimum_postfill_multiplier=2.0,
+        minimum_postfill_capacity_fraction=0.10,
+        maximum_postfill_candidates=20000,
+        topology_weight=0.30,
+    ):
+        self.capacity = int(capacity)
+        self.density_selector = density_selector
+        self.ionic_target = ionic_target
+        self.weight_exponent = float(weight_exponent)
+        self.weight_floor = float(weight_floor)
+        self.weight_smoothing = float(weight_smoothing)
+        self.guard_min_fraction = float(guard_min_fraction)
+        self.guard_max_fraction = float(guard_max_fraction)
+        self.guard_absolute_floor = float(guard_absolute_floor)
+        self.replacement_relative_tolerance = float(
+            replacement_relative_tolerance
+        )
+        self.replacement_absolute_floor = float(replacement_absolute_floor)
+        raw_window = int(np.ceil(
+            float(convergence_window_sqrt_factor) * np.sqrt(max(self.capacity, 1))
+        ))
+        self.convergence_window = int(np.clip(
+            raw_window,
+            max(1, int(convergence_window_min)),
+            max(int(convergence_window_min), int(convergence_window_max)),
+        ))
+        self.convergence_relative_gain = float(convergence_relative_gain)
+        self.convergence_max_swaps = max(
+            int(convergence_max_swaps_floor),
+            int(np.ceil(float(convergence_max_swap_fraction) * self.convergence_window)),
+        )
+        self.minimum_postfill_candidates = max(
+            self.convergence_window,
+            int(np.ceil(float(minimum_postfill_multiplier) * self.convergence_window)),
+            int(np.ceil(float(minimum_postfill_capacity_fraction) * self.capacity)),
+        )
+        self.maximum_postfill_candidates = max(
+            self.minimum_postfill_candidates,
+            int(maximum_postfill_candidates),
+        )
+        self.topology_weight = float(topology_weight)
+
+        self.entries = []
+        self.loss = float("inf")
+        self.monitor_loss = float("inf")
+        self.complete_candidates = 0
+        self.postfill_candidates = 0
+        self.fill_accepts = 0
+        self.swap_accepts = 0
+        self.rejections = 0
+        self.baseline_tvs = None
+        self.weights = {name: 1.0 / len(self.COMPONENTS) for name in self.COMPONENTS}
+        self.loss_history = []
+        self.monitor_history = deque(maxlen=self.convergence_window + 1)
+        self.swap_history = deque(maxlen=self.convergence_window + 1)
+
+    def __len__(self):
+        return len(self.entries)
+
+    @property
+    def full(self):
+        return len(self.entries) >= self.capacity
+
+    @property
+    def nonimproving_streak(self):
+        """Compatibility/logging value: candidates since the most recent swap."""
+        if not self.full or not self.swap_history:
+            return 0
+        swaps_now = self.swap_history[-1]
+        for offset, swaps in enumerate(reversed(self.swap_history)):
+            if swaps < swaps_now:
+                return offset - 1
+        return min(self.postfill_candidates, len(self.swap_history) - 1)
+
+    @property
+    def hard_stop_reached(self):
+        return self.full and self.postfill_candidates >= self.maximum_postfill_candidates
+
+    @property
+    def convergence_reason(self):
+        if self.hard_stop_reached:
+            return "hard_postfill_cap"
+        if self.converged:
+            return "rolling_good_enough"
+        return None
+
+    @property
+    def converged(self):
+        if not self.full:
+            return False
+        if self.postfill_candidates < self.minimum_postfill_candidates:
+            return False
+        if len(self.monitor_history) < self.convergence_window + 1:
+            return False
+        old = float(self.monitor_history[0])
+        new = float(self.monitor_history[-1])
+        relative_gain = max(0.0, (old - new) / max(abs(old), 1.0e-12))
+        swaps = int(self.swap_history[-1] - self.swap_history[0])
+        return (
+            relative_gain <= self.convergence_relative_gain
+            and swaps <= self.convergence_max_swaps
+        )
+
+    def _aggregate(self, entries):
+        nn = np.zeros_like(self.density_selector.accepted_counts, dtype=float)
+        ionic = {
+            name: np.zeros_like(self.ionic_target.accepted_counts[name], dtype=float)
+            for name in ("sio", "oo")
+        }
+        for entry in entries:
+            nn += np.asarray(entry["nn_desc"]["hist"], dtype=float)
+            for name in ("sio", "oo"):
+                ionic[name] += np.asarray(entry["ionic_desc"]["hist"][name], dtype=float)
+        topology_sum = sum(float(entry["integrity_desc"]["topology_loss"]) for entry in entries)
+        topology_mean = topology_sum / max(len(entries), 1)
+        return nn, ionic, topology_mean
+
+    def _component_tvs(self, nn_counts, ionic_counts):
+        return {
+            "nn": float(self.density_selector.histogram_distance(nn_counts)),
+            "sio": float(self.ionic_target._tv(
+                ionic_counts["sio"], self.ionic_target.target_probability["sio"]
+            )),
+            "oo": float(self.ionic_target._tv(
+                ionic_counts["oo"], self.ionic_target.target_probability["oo"]
+            )),
+        }
+
+    def _normalized(self, tvs):
+        if self.baseline_tvs is None:
+            return {name: float(tvs[name]) for name in self.COMPONENTS}
+        return {
+            name: float(tvs[name]) / max(float(self.baseline_tvs[name]), 1.0e-12)
+            for name in self.COMPONENTS
+        }
+
+    def _objective(self, tvs):
+        normalized = self._normalized(tvs)
+        if self.baseline_tvs is None:
+            loss = float(np.mean(list(normalized.values())))
+        else:
+            loss = float(sum(self.weights[name] * normalized[name]
+                             for name in self.COMPONENTS))
+        monitor = float(np.mean(list(normalized.values())))
+        return loss, monitor, normalized
+
+    def _metrics_from_counts(self, nn_counts, ionic_counts, topology_mean):
+        tvs = self._component_tvs(nn_counts, ionic_counts)
+        loss, monitor, normalized = self._objective(tvs)
+        topology_mean = float(topology_mean)
+        loss += self.topology_weight * topology_mean
+        monitor += self.topology_weight * topology_mean
+        return {
+            "loss": loss,
+            "monitor_loss": monitor,
+            "topology_loss": topology_mean,
+            "nn_tv": tvs["nn"],
+            "sio_tv": tvs["sio"],
+            "oo_tv": tvs["oo"],
+            "normalized": normalized,
+        }
+
+    def current_components(self):
+        if not self.entries:
+            return {
+                "loss": float("nan"), "monitor_loss": float("nan"),
+                "nn_tv": float("nan"), "sio_tv": float("nan"),
+                "oo_tv": float("nan"), "topology_loss": float("nan"),
+                "normalized": {},
+            }
+        nn, ionic, topology = self._aggregate(self.entries)
+        return self._metrics_from_counts(nn, ionic, topology)
+
+    def _initialize_postfill_reference(self):
+        nn, ionic, topology = self._aggregate(self.entries)
+        tvs = self._component_tvs(nn, ionic)
+        self.baseline_tvs = {
+            name: max(float(tvs[name]), 1.0e-12) for name in self.COMPONENTS
+        }
+        self.weights = {name: 1.0 / len(self.COMPONENTS) for name in self.COMPONENTS}
+        comp = self._metrics_from_counts(nn, ionic, topology)
+        self.loss = comp["loss"]
+        self.monitor_loss = comp["monitor_loss"]
+        self.monitor_history.clear()
+        self.swap_history.clear()
+        self.monitor_history.append(self.monitor_loss)
+        self.swap_history.append(self.swap_accepts)
+
+    def begin_round(self):
+        """Update adaptive weights once, using the current unresolved errors."""
+        if not self.full or self.baseline_tvs is None:
+            return
+        comp = self.current_components()
+        unresolved = comp["normalized"]
+        raw = {
+            name: max(float(unresolved[name]), self.weight_floor)
+            ** self.weight_exponent
+            for name in self.COMPONENTS
+        }
+        scale = max(sum(raw.values()), 1.0e-12)
+        target = {name: raw[name] / scale for name in self.COMPONENTS}
+        alpha = self.weight_smoothing
+        smoothed = {
+            name: (1.0 - alpha) * self.weights[name] + alpha * target[name]
+            for name in self.COMPONENTS
+        }
+        norm = max(sum(smoothed.values()), 1.0e-12)
+        self.weights = {name: smoothed[name] / norm for name in self.COMPONENTS}
+        refreshed = self.current_components()
+        self.loss = refreshed["loss"]
+        self.monitor_loss = refreshed["monitor_loss"]
+
+    def _guard_fraction(self, current_monitor):
+        # At the post-fill reference monitor=1, use the broad guard.  Tighten
+        # smoothly toward guard_min_fraction as the normalized error shrinks.
+        progress_scale = float(np.clip(current_monitor, 0.0, 1.0))
+        return self.guard_min_fraction + (
+            self.guard_max_fraction - self.guard_min_fraction
+        ) * progress_scale
+
+    def _passes_guards(self, current_tvs, trial_tvs, guard_fraction):
+        for name in self.COMPONENTS:
+            allowance = max(
+                self.guard_absolute_floor,
+                guard_fraction * max(float(current_tvs[name]), 0.0),
+            )
+            if float(trial_tvs[name]) > float(current_tvs[name]) + allowance:
+                return False
+        return True
+
+    def _required_improvement(self, current_loss):
+        return max(
+            self.replacement_absolute_floor,
+            self.replacement_relative_tolerance * max(abs(current_loss), 1.0e-12),
+        )
+
+    def _record_postfill_candidate(self):
+        self.postfill_candidates += 1
+        comp = self.current_components()
+        self.loss = comp["loss"]
+        self.monitor_loss = comp["monitor_loss"]
+        self.monitor_history.append(self.monitor_loss)
+        self.swap_history.append(self.swap_accepts)
+
+    def _sync_selectors(self):
+        nn, ionic, _topology = self._aggregate(self.entries)
+        self.density_selector.accepted_counts = nn.copy()
+        self.density_selector.accepted_values = []
+        self.density_selector.accepted_structures = len(self.entries)
+        for entry in self.entries:
+            self.density_selector.accepted_values.extend(
+                np.asarray(entry["nn_desc"]["nn"], dtype=float).tolist()
+            )
+
+        self.ionic_target.accepted_counts = {
+            name: ionic[name].copy() for name in ("sio", "oo")
+        }
+        self.ionic_target.accepted_values = {"sio": [], "oo": []}
+        self.ionic_target.accepted_structures = len(self.entries)
+        for entry in self.entries:
+            for name in ("sio", "oo"):
+                self.ionic_target.accepted_values[name].extend(
+                    np.asarray(entry["ionic_desc"]["values"][name], dtype=float).tolist()
+                )
+
+    def consider(self, row, nn_desc, ionic_desc, integrity_desc):
+        self.complete_candidates += 1
+        entry = {
+            "row": row.copy(), "nn_desc": nn_desc,
+            "ionic_desc": ionic_desc, "integrity_desc": integrity_desc,
+        }
+
+        if not self.full:
+            self.entries.append(entry)
+            self.fill_accepts += 1
+            self._sync_selectors()
+            if self.full:
+                self._initialize_postfill_reference()
+            else:
+                comp = self.current_components()
+                self.loss = comp["loss"]
+                self.monitor_loss = comp["monitor_loss"]
+            self.loss_history.append(self.loss)
+            return {"action": "fill", "removed": None, **self.current_components()}
+
+        current_nn, current_ionic, current_topology = self._aggregate(self.entries)
+        current = self._metrics_from_counts(current_nn, current_ionic, current_topology)
+        current_tvs = {
+            "nn": current["nn_tv"], "sio": current["sio_tv"], "oo": current["oo_tv"]
+        }
+        guard_fraction = self._guard_fraction(current["monitor_loss"])
+        required = self._required_improvement(current["loss"])
+        candidate_nn = np.asarray(nn_desc["hist"], dtype=float)
+        candidate_ionic = {
+            name: np.asarray(ionic_desc["hist"][name], dtype=float)
+            for name in ("sio", "oo")
+        }
+
+        best_index = None
+        best = None
+        for i, old in enumerate(self.entries):
+            trial_nn = current_nn + candidate_nn - np.asarray(
+                old["nn_desc"]["hist"], dtype=float
+            )
+            trial_ionic = {
+                name: current_ionic[name] + candidate_ionic[name]
+                - np.asarray(old["ionic_desc"]["hist"][name], dtype=float)
+                for name in ("sio", "oo")
+            }
+            trial_topology = (
+                current_topology * len(self.entries)
+                + float(integrity_desc["topology_loss"])
+                - float(old["integrity_desc"]["topology_loss"])
+            ) / max(len(self.entries), 1)
+            trial = self._metrics_from_counts(trial_nn, trial_ionic, trial_topology)
+            trial_tvs = {
+                "nn": trial["nn_tv"], "sio": trial["sio_tv"], "oo": trial["oo_tv"]
+            }
+            if not self._passes_guards(current_tvs, trial_tvs, guard_fraction):
+                continue
+            if best is None or trial["loss"] < best["loss"]:
+                best_index = i
+                best = trial
+
+        if best_index is not None and best["loss"] < current["loss"] - required:
+            self.entries[best_index] = entry
+            self.swap_accepts += 1
+            self._sync_selectors()
+            self.loss = best["loss"]
+            self.monitor_loss = best["monitor_loss"]
+            self.loss_history.append(self.loss)
+            self._record_postfill_candidate()
+            return {
+                "action": "swap", "removed": best_index,
+                "improvement": current["loss"] - best["loss"],
+                "required_improvement": required,
+                "guard_fraction": guard_fraction,
+                **best,
+            }
+
+        self.rejections += 1
+        self.loss = current["loss"]
+        self.monitor_loss = current["monitor_loss"]
+        self._record_postfill_candidate()
+        return {
+            "action": "reject", "removed": None,
+            "improvement": 0.0,
+            "required_improvement": required,
+            "guard_fraction": guard_fraction,
+            **current,
+        }
+
+    def adaptive_status(self):
+        comp = self.current_components()
+        if self.full:
+            guard = self._guard_fraction(comp["monitor_loss"])
+            required = self._required_improvement(comp["loss"])
+        else:
+            guard = float("nan")
+            required = float("nan")
+
+        window_ready = len(self.monitor_history) >= self.convergence_window + 1
+        if window_ready:
+            old_monitor = float(self.monitor_history[0])
+            new_monitor = float(self.monitor_history[-1])
+            window_relative_gain = (
+                old_monitor - new_monitor
+            ) / max(abs(old_monitor), 1.0e-12)
+            window_swaps = int(self.swap_history[-1] - self.swap_history[0])
+        else:
+            window_relative_gain = float("nan")
+            window_swaps = 0
+
+        return {
+            **comp,
+            "weights": dict(self.weights),
+            "guard_fraction": guard,
+            "required_improvement": required,
+            "window": self.convergence_window,
+            "window_ready": window_ready,
+            "window_relative_gain": window_relative_gain,
+            "window_swaps": window_swaps,
+            "minimum_postfill": self.minimum_postfill_candidates,
+            "maximum_postfill": self.maximum_postfill_candidates,
+            "hard_stop_reached": self.hard_stop_reached,
+            "convergence_reason": self.convergence_reason,
+        }
+
+    def rows(self):
+        if not self.entries:
+            return pd.DataFrame()
+        return pd.concat([entry["row"] for entry in self.entries], ignore_index=True)
 
 
 class SequentialOxygenConstructor:
@@ -2159,7 +2707,7 @@ def _search_one_si_framework(task):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Wyckoff-parameterized factorized VAE for SiO2 LEGO-Xtal data"
+        description="Wyckoff-parameterized factorized VAE for TiO2 LEGO-Xtal data"
     )
     parser.add_argument("--data", required=True)
     parser.add_argument("--epochs", type=int, default=250)
@@ -2168,23 +2716,31 @@ def main():
     parser.add_argument("--cutoff", type=int, default=None)
     parser.add_argument("--sample", type=int, default=100000)
     parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument(
+        "--composition",
+        default="1,2",
+        help=(
+            "Center:sublattice stoichiometric coefficients used by the "
+            "Wyckoff multiplicity masks (default: 1,2 for TiO2)."
+        ),
+    )
     parser.add_argument("--context-end", type=float, default=0.8)
     parser.add_argument("--selection-block-size", type=int, default=64,
         help="Candidates committed per adaptive selector update.")
     parser.add_argument("--selection-min-score", type=float, default=0.0,
         help=argparse.SUPPRESS)
     parser.add_argument("--nn-bins", type=int, default=40,
-        help="Histogram bins for per-Si periodic nearest-neighbour distances.")
+        help="Histogram bins for per-Ti periodic nearest-neighbour distances.")
     parser.add_argument("--nn-oversample-factor", type=float, default=1.0,
         help=argparse.SUPPRESS)
     parser.add_argument("--nn-round-size", type=int, default=2000,
         help="Maximum number of candidates generated in one online-selection round.")
     parser.add_argument("--nn-overfill-penalty", type=float, default=1.0)
     parser.add_argument("--nn-selection-temperature", type=float, default=0.01)
-    parser.add_argument("--si-min-terminal", type=float, default=1.67,
-        help="Broad zero-probability Si-Si safety floor in angstrom.")
+    parser.add_argument("--si-min-terminal", type=float, default=2.20,
+        help="Broad zero-probability Ti-Ti safety floor in angstrom.")
     parser.add_argument("--nn-target-sigma-scale", type=float, default=1.0,
-        help="Multiply the measured training per-Si NN standard deviation by this factor.")
+        help="Multiply the measured training per-Ti NN standard deviation by this factor.")
     parser.add_argument("--nn-histogram-sigma-span", type=float, default=4.0,
         help="Minimum histogram span on each side of the Gaussian mean, in target sigma.")
     parser.add_argument("--gpu-contact-batch", type=int, default=128)
@@ -2194,7 +2750,7 @@ def main():
     parser.add_argument("--min-terminal-round-size", type=int, default=1000)
     parser.add_argument("--max-sample-rounds", type=int, default=100)
     parser.add_argument("--nn-image-range", type=int, default=1,
-        help="Periodic translation range used for exact per-Si nearest neighbours.")
+        help="Periodic translation range used for exact per-Ti nearest neighbours.")
     parser.add_argument("--geometry-workers", type=int, default=3,
         help="CPU worker processes for symmetry expansion; 0 or 1 keeps serial behavior.")
     parser.add_argument("--o-shell-bins", type=int, default=40)
@@ -2206,17 +2762,75 @@ def main():
         help="Distinct O skeletons sampled from the conditional decoder per fixed Si.")
     parser.add_argument("--o-sequential-oo-min", type=float, default=1.20,
         help="Catastrophic O-O distance floor used only as an exclusion constraint.")
-    parser.add_argument("--o-sequential-sio-min", type=float, default=1.20,
-        help="Catastrophic Si-O distance floor during constructive placement.")
+    parser.add_argument("--o-sequential-sio-min", type=float, default=1.50,
+        help="Catastrophic Ti-O distance floor during constructive placement.")
     parser.add_argument("--ionic-sio-sigma-scale", type=float, default=0.50,
-        help="Compress the pooled Si-O training standard deviation by this factor.")
+        help="Compress the pooled Ti-O training standard deviation by this factor.")
     parser.add_argument("--ionic-oo-sigma-scale", type=float, default=0.50,
         help="Compress the nearest O-O training standard deviation by this factor.")
-    parser.add_argument("--ionic-max-mean-z2", type=float, default=3.0,
-        help="Maximum mean squared narrowed-Gaussian z score for final acceptance.")
-    parser.add_argument("--ionic-max-tv", type=float, default=0.70,
-        help="Maximum mean TV distance of the pooled Si-O and O-O histograms.")
+    parser.add_argument("--pool-fill-candidate-batch", type=int, default=1000,
+        help=(
+            "Minimum number of complete candidate frameworks targeted per round while "
+            "the output pool is still filling. This fixed additive workload prevents "
+            "sampling throughput from contracting with the number of remaining slots."
+        ))
+    parser.add_argument("--pool-candidate-batch", type=int, default=100,
+        help="Complete valid candidates evaluated per round after the output pool is full.")
+    parser.add_argument("--pool-weight-exponent", type=float, default=1.0,
+        help="Exponent applied to unresolved normalized distribution errors when adapting weights.")
+    parser.add_argument("--pool-weight-floor", type=float, default=0.10,
+        help="Minimum unresolved-error basis retained by every adaptive component weight.")
+    parser.add_argument("--pool-weight-smoothing", type=float, default=0.20,
+        help="Round-wise interpolation fraction toward newly inferred adaptive weights.")
+    parser.add_argument("--pool-guard-min-fraction", type=float, default=0.05,
+        help="Late-stage maximum relative degradation permitted for any distribution component.")
+    parser.add_argument("--pool-guard-max-fraction", type=float, default=0.20,
+        help="Early-stage maximum relative degradation permitted for any distribution component.")
+    parser.add_argument("--pool-guard-absolute-floor", type=float, default=0.002,
+        help="Absolute TV degradation allowance used when percentage guards become too small.")
+    parser.add_argument("--pool-replacement-relative-tolerance", type=float, default=1.0e-3,
+        help="Required replacement improvement as a fraction of current adaptive pool loss.")
+    parser.add_argument("--pool-replacement-absolute-floor", type=float, default=1.0e-5,
+        help="Absolute lower floor on required adaptive pool-loss improvement.")
+    parser.add_argument("--pool-convergence-window-sqrt-factor", type=float, default=50.0,
+        help="Convergence window scales as this factor times sqrt(pool capacity).")
+    parser.add_argument("--pool-convergence-window-min", type=int, default=500,
+        help="Minimum rolling convergence-window size in complete candidates.")
+    parser.add_argument("--pool-convergence-window-max", type=int, default=5000,
+        help="Maximum rolling convergence-window size in complete candidates.")
+    parser.add_argument("--pool-convergence-relative-gain", type=float, default=1.0e-2,
+        help="Good-enough maximum monitor-loss gain over a converged window. Default: 1 percent.")
+    parser.add_argument("--pool-convergence-max-swap-fraction", type=float, default=2.0e-3,
+        help="Maximum accepted-swap fraction allowed within a converged window.")
+    parser.add_argument("--pool-convergence-max-swaps-floor", type=int, default=2,
+        help="Minimum absolute swap allowance within a convergence window.")
+    parser.add_argument("--pool-minimum-postfill-multiplier", type=float, default=2.0,
+        help="Minimum post-fill budget as a multiple of the convergence window.")
+    parser.add_argument("--pool-minimum-postfill-capacity-fraction", type=float, default=0.10,
+        help="Additional minimum post-fill budget as a fraction of pool capacity.")
+    parser.add_argument("--pool-maximum-postfill-candidates", type=int, default=20000,
+        help="Unconditional hard cap on complete post-fill candidates.")
+    parser.add_argument("--pool-topology-weight", type=float, default=0.30,
+        help="Fixed weight of mean TiO6/OTi3 topology quality in pool replacement.")
+    parser.add_argument("--integrity-max-ti-o", type=float, default=2.6)
+    parser.add_argument("--integrity-max-o-ti", type=float, default=2.6)
+    parser.add_argument("--integrity-max-angle-rms", type=float, default=22.0)
+    parser.add_argument("--integrity-min-ti-pass-fraction", type=float, default=1.0)
+    parser.add_argument("--integrity-min-o-pass-fraction", type=float, default=1.0)
     args = parser.parse_args()
+
+    try:
+        composition_ratio = tuple(
+            int(value.strip()) for value in str(args.composition).split(",")
+        )
+    except ValueError as exc:
+        raise ValueError(
+            "--composition must contain two positive integers, e.g. 1,2."
+        ) from exc
+    if len(composition_ratio) != 2 or any(value <= 0 for value in composition_ratio):
+        raise ValueError(
+            "--composition must contain exactly two positive integers, e.g. 1,2."
+        )
 
     if not os.path.isfile(args.data):
         raise FileNotFoundError(args.data)
@@ -2246,10 +2860,48 @@ def main():
         raise ValueError("Sequential O distance floors must be positive.")
     if args.ionic_sio_sigma_scale <= 0 or args.ionic_oo_sigma_scale <= 0:
         raise ValueError("Ionic Gaussian sigma scales must be positive.")
-    if args.ionic_max_mean_z2 <= 0:
-        raise ValueError("--ionic-max-mean-z2 must be positive.")
-    if not 0.0 <= args.ionic_max_tv <= 1.0:
-        raise ValueError("--ionic-max-tv must lie in [0,1].")
+    if args.pool_fill_candidate_batch < 1:
+        raise ValueError("--pool-fill-candidate-batch must be positive.")
+    if args.pool_candidate_batch < 1:
+        raise ValueError("--pool-candidate-batch must be positive.")
+    if args.pool_weight_exponent < 0:
+        raise ValueError("--pool-weight-exponent must be non-negative.")
+    if not 0 < args.pool_weight_floor <= 1:
+        raise ValueError("--pool-weight-floor must be in (0, 1].")
+    if not 0 <= args.pool_weight_smoothing <= 1:
+        raise ValueError("--pool-weight-smoothing must be in [0, 1].")
+    if not 0 <= args.pool_guard_min_fraction <= args.pool_guard_max_fraction:
+        raise ValueError("Pool guard fractions must satisfy 0 <= min <= max.")
+    if args.pool_guard_absolute_floor < 0:
+        raise ValueError("--pool-guard-absolute-floor must be non-negative.")
+    if (args.pool_replacement_relative_tolerance < 0
+            or args.pool_replacement_absolute_floor < 0):
+        raise ValueError("Pool replacement tolerances must be non-negative.")
+    if args.pool_convergence_window_sqrt_factor <= 0:
+        raise ValueError("--pool-convergence-window-sqrt-factor must be positive.")
+    if args.pool_convergence_window_min < 1:
+        raise ValueError("--pool-convergence-window-min must be at least 1.")
+    if args.pool_convergence_window_max < args.pool_convergence_window_min:
+        raise ValueError("Pool convergence window max must be >= min.")
+    if args.pool_convergence_relative_gain < 0:
+        raise ValueError("--pool-convergence-relative-gain must be non-negative.")
+    if args.pool_convergence_max_swap_fraction < 0:
+        raise ValueError("--pool-convergence-max-swap-fraction must be non-negative.")
+    if args.pool_convergence_max_swaps_floor < 0:
+        raise ValueError("--pool-convergence-max-swaps-floor must be non-negative.")
+    if args.pool_minimum_postfill_multiplier <= 0:
+        raise ValueError("--pool-minimum-postfill-multiplier must be positive.")
+    if args.pool_minimum_postfill_capacity_fraction < 0:
+        raise ValueError("--pool-minimum-postfill-capacity-fraction must be non-negative.")
+    if args.pool_maximum_postfill_candidates < 1:
+        raise ValueError("--pool-maximum-postfill-candidates must be at least 1.")
+    if args.pool_topology_weight < 0:
+        raise ValueError("--pool-topology-weight must be non-negative.")
+    if min(args.integrity_max_ti_o, args.integrity_max_o_ti, args.integrity_max_angle_rms) <= 0:
+        raise ValueError("Integrity distance and angle thresholds must be positive.")
+    if not (0 <= args.integrity_min_ti_pass_fraction <= 1 and
+            0 <= args.integrity_min_o_pass_fraction <= 1):
+        raise ValueError("Integrity pass fractions must lie in [0, 1].")
     if args.nn_overfill_penalty < 0 or args.nn_selection_temperature < 0:
         raise ValueError("NN selection penalties must be nonnegative.")
     if args.nn_target_sigma_scale <= 0 or args.nn_histogram_sigma_span <= 1:
@@ -2282,8 +2934,16 @@ def main():
         canonical_df, num_wps, n_si_max, n_o_max
     )
 
-    first_a = float(global_df["a"].iloc[0])
-    discrete_cell = abs(first_a - round(first_a)) < 1e-2
+    # Treat the cell block as discrete only when every cell value in the
+    # complete dataset is integer encoded.  Inspecting only the first ``a``
+    # value can misclassify an ordinary continuous dataset when that lattice
+    # constant happens to lie close to an integer.
+    cell_columns = ["a", "b", "c", "alpha", "beta", "gamma"]
+    cell_values = global_df[cell_columns].to_numpy(dtype=float)
+    discrete_cell = bool(
+        np.all(np.isfinite(cell_values))
+        and np.max(np.abs(cell_values - np.rint(cell_values))) < 1.0e-6
+    )
     # Free Wyckoff parameters are continuous in [0, 1); -1 marks padding.
     discrete_coordinates = False
 
@@ -2297,25 +2957,29 @@ def main():
         o_discrete += [c for c in o_df.columns if c != "o_skeleton_token"]
 
     data_name = os.path.splitext(os.path.basename(args.data))[0]
-    model_folder = os.path.join("models", data_name, "FactorizedVAE_v40_cached_ionic_field")
+    model_folder = os.path.join("models", data_name, "FactorizedVAE_tio2_v3_fixed_capacity_pool")
     sample_folder = os.path.join("data", "sample")
     os.makedirs(model_folder, exist_ok=True)
     os.makedirs(sample_folder, exist_ok=True)
 
     print(f"Rows: {len(df)}")
+    print(
+        "Chemistry roles: "
+        f"Ti target_coord={SI_CN}, O target_coord={O_CN}, "
+        f"composition={composition_ratio}"
+    )
     print(f"Original slots: {num_wps}")
-    print(f"Si block capacity: {n_si_max}")
+    print(f"Ti block capacity: {n_si_max}")
     print(f"O block capacity: {n_o_max}")
     print(f"Global columns: {global_df.columns.tolist()}")
-    print(f"Si columns: {si_df.columns.tolist()}")
+    print(f"Ti block columns (legacy si_* names): {si_df.columns.tolist()}")
     print(f"O columns: {o_df.columns.tolist()}")
     print(f"Discrete cell: {discrete_cell}")
     print(f"Discrete coordinates: {discrete_coordinates}")
     print(
         "O construction: crystallographic skeleton prior with cached pooled "
-        "Si-O and O-O ionic probability fields."
+        "Ti-O and O-O ionic probability fields."
     )
-    geometry_loss = None
     density_selector = OnlinePerSiNearestNeighborSelector(
         canonical_df,
         num_wps=num_wps,
@@ -2335,7 +2999,7 @@ def main():
     )
     tq = density_selector.training_quantiles
     print(
-        "Online per-Si nearest-neighbour selector: "
+        "Online per-Ti nearest-neighbour selector: "
         f"bins={args.nn_bins}, adaptive_block={args.selection_block_size}, "
         f"round_size={args.nn_round_size}, safety_floor={args.si_min_terminal:.3f} A, "
         f"gpu_geometry_cap={args.gpu_geometry_memory_gib:.2f} GiB"
@@ -2346,19 +3010,28 @@ def main():
         f"O_search=beam{args.o_sequential_beam_width}, "
         f"cached_candidates/site={args.o_sequential_candidates_per_site}, "
         f"skeletons={args.o_sequential_skeletons}, "
-        f"SiO_sigma_scale={args.ionic_sio_sigma_scale:g}, "
+        f"TiO_sigma_scale={args.ionic_sio_sigma_scale:g}, "
         f"OO_sigma_scale={args.ionic_oo_sigma_scale:g}, "
-        f"ionic_max_z2={args.ionic_max_mean_z2:g}, "
-        f"ionic_max_TV={args.ionic_max_tv:g}, "
-        f"SiO/OO floors={args.o_sequential_sio_min:g}/"
+        f"pool_capacity={args.sample}, "
+        f"pool_fill_candidate_batch={args.pool_fill_candidate_batch}, "
+        f"pool_candidate_batch={args.pool_candidate_batch}, "
+        f"adaptive_weight=(p={args.pool_weight_exponent:g},floor={args.pool_weight_floor:g},"
+        f"smooth={args.pool_weight_smoothing:g}), "
+        f"guard={args.pool_guard_min_fraction:.1%}..{args.pool_guard_max_fraction:.1%} "
+        f"(abs={args.pool_guard_absolute_floor:g}), "
+        f"replacement_tol={args.pool_replacement_relative_tolerance:.2%} "
+        f"(abs={args.pool_replacement_absolute_floor:g}), "
+        f"convergence_window={args.pool_convergence_window_sqrt_factor:g}*sqrt(N) "
+        f"clipped[{args.pool_convergence_window_min},{args.pool_convergence_window_max}], "
+        f"TiO/OO floors={args.o_sequential_sio_min:g}/"
         f"{args.o_sequential_oo_min:g} A"
     )
     print(
-        "Per-Si NN training reference:\n"
+        "Per-Ti NN training reference:\n"
         f"  valid structures={density_selector.training_structures}/{len(canonical_df)}, "
         f"skipped={density_selector.skipped_training}, "
-        f"Si environments={len(density_selector.training_values)}, "
-        f"mean Si/structure={density_selector.mean_training_nsi:.2f}\n"
+        f"Ti environments={len(density_selector.training_values)}, "
+        f"mean Ti/structure={density_selector.mean_training_nsi:.2f}\n"
         f"  mean/std={density_selector.target_mean:.4f}/"
         f"{np.std(density_selector.training_values):.4f} A\n"
         f"  q01/q05/q25/q50/q75/q95/q99="
@@ -2387,9 +3060,9 @@ def main():
     )
     print(
         "Narrowed pooled ionic targets: "
-        "Si-O = Si->O1..O4 plus O->Si1..Si2; O-O = nearest periodic O neighbour"
+        "Ti-O = Ti->O1..O6 plus O->Ti1..Ti3; O-O = nearest periodic O neighbour"
     )
-    for name, label in (("sio", "Si-O pooled"), ("oo", "O-O nearest")):
+    for name, label in (("sio", "Ti-O pooled"), ("oo", "O-O nearest")):
         arr = ionic_target.training[name]
         q = np.percentile(arr, [5, 50, 95])
         print(
@@ -2408,7 +3081,6 @@ def main():
         seed=args.seed + 29,
     )
 
-    shell_batch_size = 16
     o_noise_dim = 32
     o_noise_scale = 1.0
 
@@ -2425,8 +3097,6 @@ def main():
         kl_warmup_epochs=min(50, args.epochs),
         predicted_context_start=0.0,
         predicted_context_end=args.context_end,
-        shell_loss_weight=0.0,
-        shell_batch_size=shell_batch_size,
         o_noise_dim=o_noise_dim,
         o_noise_scale=o_noise_scale,
         cuda=torch.cuda.is_available(),
@@ -2445,16 +3115,45 @@ def main():
         global_discrete_columns=global_discrete,
         si_discrete_columns=si_discrete,
         o_discrete_columns=o_discrete,
-        geometry_data=geometry_loss,
     )
 
     print(
-        "Training complete. Starting Si sampling and cached ionic-field O construction.",
+        "Training complete. Starting Ti sampling and adaptive fixed-capacity distribution-pool optimization.",
         flush=True,
     )
 
 
-    accepted_batches = []
+    integrity_evaluator = TiO2IntegrityEvaluator(
+        max_ti_o=args.integrity_max_ti_o,
+        max_o_ti=args.integrity_max_o_ti,
+        max_angle_rms=args.integrity_max_angle_rms,
+        min_ti_pass_fraction=args.integrity_min_ti_pass_fraction,
+        min_o_pass_fraction=args.integrity_min_o_pass_fraction,
+    )
+
+    pool = FixedCapacityDistributionPool(
+        capacity=args.sample,
+        density_selector=density_selector,
+        ionic_target=ionic_target,
+        weight_exponent=args.pool_weight_exponent,
+        weight_floor=args.pool_weight_floor,
+        weight_smoothing=args.pool_weight_smoothing,
+        guard_min_fraction=args.pool_guard_min_fraction,
+        guard_max_fraction=args.pool_guard_max_fraction,
+        guard_absolute_floor=args.pool_guard_absolute_floor,
+        replacement_relative_tolerance=args.pool_replacement_relative_tolerance,
+        replacement_absolute_floor=args.pool_replacement_absolute_floor,
+        convergence_window_sqrt_factor=args.pool_convergence_window_sqrt_factor,
+        convergence_window_min=args.pool_convergence_window_min,
+        convergence_window_max=args.pool_convergence_window_max,
+        convergence_relative_gain=args.pool_convergence_relative_gain,
+        convergence_max_swap_fraction=args.pool_convergence_max_swap_fraction,
+        convergence_max_swaps_floor=args.pool_convergence_max_swaps_floor,
+        minimum_postfill_multiplier=args.pool_minimum_postfill_multiplier,
+        minimum_postfill_capacity_fraction=args.pool_minimum_postfill_capacity_fraction,
+        maximum_postfill_candidates=args.pool_maximum_postfill_candidates,
+        topology_weight=args.pool_topology_weight,
+    )
     accepted_count = 0
     total_generated = 0
     total_o_proposals = 0
@@ -2507,19 +3206,53 @@ def main():
     )
 
     for sample_round in range(1, args.max_sample_rounds + 1):
-        remaining = args.sample - accepted_count
-        print(
-            f"Sampling round {sample_round} start: remaining={remaining}, "
-            f"cumulative={accepted_count}/{args.sample}",
-            flush=True,
-        )
-        if remaining <= 0:
+        accepted_count = len(pool)
+        remaining = max(args.sample - accepted_count, 0)
+        phase = "fill" if remaining > 0 else "replace"
+        if phase == "replace":
+            pool.begin_round()
+        round_start = time.perf_counter()
+        adaptive = pool.adaptive_status()
+        if pool.convergence_reason is not None:
+            if pool.convergence_reason == "hard_postfill_cap":
+                print(
+                    "Safe stop: hard post-fill candidate cap reached "
+                    f"({pool.postfill_candidates}/{pool.maximum_postfill_candidates}).",
+                    flush=True,
+                )
+            else:
+                print(
+                    "Good-enough rolling convergence reached: "
+                    f"window={pool.convergence_window}, "
+                    f"postfill={pool.postfill_candidates}.",
+                    flush=True,
+                )
             break
 
+        if remaining > 0:
+            # Keep a fixed additive fill workload instead of contracting the
+            # expensive oxygen-construction stage as the pool approaches full.
+            # Any candidates processed after the pool fills naturally become
+            # replacement trials within the same round.
+            candidate_target = max(
+                remaining,
+                args.pool_fill_candidate_batch,
+            )
+        else:
+            safe_budget_left = max(
+                pool.maximum_postfill_candidates - pool.postfill_candidates, 0
+            )
+            candidate_target = min(args.pool_candidate_batch, safe_budget_left)
+            if candidate_target <= 0:
+                print(
+                    "Safe stop: no post-fill candidate budget remains.",
+                    flush=True,
+                )
+                break
         draw_size = min(
             args.nn_round_size,
             max(
-                int(np.ceil(remaining * args.nn_oversample_factor)),
+                int(np.ceil(candidate_target * args.nn_oversample_factor)),
                 min(args.min_terminal_round_size, args.nn_round_size),
             ),
         )
@@ -2530,7 +3263,8 @@ def main():
             draw_size,
             temperature=args.temperature,
             hard=True,
-            enforce_sio2_multiplicity=True,
+            enforce_composition_multiplicity=True,
+            composition_ratio=composition_ratio,
             max_independent_sites=num_wps,
             si_skeleton_feasibility=None,
         )
@@ -2544,12 +3278,12 @@ def main():
         if len(valid_state_indices) == 0:
             print(
                 f"Sampling round {sample_round}: generated={draw_size}, "
-                "no multiplicity-valid Si candidates."
+                "no multiplicity-valid Ti candidates."
             )
             continue
         si_state = subset_si_state(si_state_all, valid_state_indices)
 
-        # Reconstruct only Si rows, then expand/check Si geometry.
+        # Reconstruct only Ti rows, then expand/check Ti geometry.
         t_stage = time.perf_counter()
         si_rows, si_source_positions, rejected_si_recon = blocks_to_si_rows(
             si_state["global_df"], si_state["si_df"], num_wps, n_si_max
@@ -2559,7 +3293,7 @@ def main():
             timing["cpu_si_expansion"] += time.perf_counter() - t_stage
             print(
                 f"Sampling round {sample_round}: generated={draw_size}, "
-                "no reconstructable Si candidates."
+                "no reconstructable Ti candidates."
             )
             continue
         si_state = subset_si_state(si_state, si_source_positions)
@@ -2581,19 +3315,20 @@ def main():
         if not si_descriptions:
             print(
                 f"Sampling round {sample_round}: generated={draw_size}, "
-                f"Si_rows={len(si_rows)}, safety_valid=0."
+                f"Ti_rows={len(si_rows)}, safety_valid=0."
             )
             continue
 
-        # Confirm exactly the best Si frameworks currently needed.  They are
+        # Confirm exactly the best Ti frameworks currently needed.  They are
         # frozen and retained while oxygen is repeatedly sampled around them.
         t_stage = time.perf_counter()
+        framework_target = min(candidate_target, len(si_descriptions))
         si_local = density_selector.select(
             si_descriptions,
-            remaining=remaining,
+            remaining=framework_target,
             commit=False,
             block_size=args.selection_block_size,
-            max_selected=remaining,
+            max_selected=framework_target,
         )
         timing["si_selection_scoring"] += time.perf_counter() - t_stage
         confirmed_row_positions = np.asarray(
@@ -2624,7 +3359,8 @@ def main():
             proposals_per_si=args.o_sequential_skeletons,
             temperature=args.temperature,
             hard=True,
-            enforce_sio2_multiplicity=True,
+            enforce_composition_multiplicity=True,
+            composition_ratio=composition_ratio,
             max_independent_sites=num_wps,
         )
         timing["vae_o_generation"] += time.perf_counter() - t_stage
@@ -2671,25 +3407,33 @@ def main():
                 update_raw=True,
             )
             timing["gpu_o_first_shell"] += time.perf_counter() - t_desc
-            if (
-                accepted_count + len(accepted_this_round) < args.sample
-                and desc["mean_z2"] <= args.ionic_max_mean_z2
-                and desc["mean_tv"] <= args.ionic_max_tv
-            ):
-                quality = (-desc["mean_z2"], -desc["mean_tv"])
-                accepted_this_round.append(
-                    (parent_global, desc, full_rows.iloc[[0]].copy(), quality)
+            nn_desc = si_descriptions[int(confirmed_si_desc_indices[parent_global])]
+            integrity_desc = integrity_evaluator.evaluate(
+                np.asarray(si_item["si"], dtype=np.float32),
+                np.asarray(result["oxygen"], dtype=np.float32),
+                np.asarray(si_item["cell"], dtype=np.float32),
+            )
+            if not integrity_desc["integrity_valid"]:
+                decision = {"action": "integrity_reject", **integrity_desc}
+                integrity_evaluator.record(
+                    sample_round, parent_global, "integrity_reject", integrity_desc
                 )
-                ionic_target.commit(desc)
-                density_selector.commit(
-                    si_descriptions,
-                    [int(confirmed_si_desc_indices[parent_global])],
-                )
+                accepted_this_round.append((parent_global, decision))
                 if parent_global in unresolved:
                     unresolved.remove(parent_global)
+                return "integrity_reject"
+            decision = pool.consider(
+                full_rows.iloc[[0]].copy(), nn_desc, desc, integrity_desc
+            )
+            integrity_evaluator.record(
+                sample_round, parent_global, decision["action"], integrity_desc
+            )
+            accepted_this_round.append((parent_global, decision))
+            if parent_global in unresolved:
+                unresolved.remove(parent_global)
+            if decision["action"] in {"fill", "swap"}:
                 sequential_passed += 1
-                return True
-            return False
+            return decision["action"]
 
         search_tasks = []
         for parent_global in list(unresolved):
@@ -2708,15 +3452,11 @@ def main():
 
         manager_start = time.perf_counter()
         manager_completed = len(confirmed_row_positions) - len(search_tasks)
-        manager_failed = manager_completed
+        manager_exhausted = manager_completed
+        manager_valid = 0
+        manager_retained = 0
+        manager_nonimproving = 0
         manager_errors = 0
-        progress_step = max(1, len(confirmed_row_positions) // 100)
-        print(
-            f"Sampling round {sample_round}: O manager start, "
-            f"frameworks={len(search_tasks)}, workers="
-            f"{args.geometry_workers if o_executor is not None else 1}",
-            flush=True,
-        )
 
         if o_executor is None:
             _init_o_worker(ionic_target, o_worker_config)
@@ -2727,23 +3467,20 @@ def main():
                     payload["result"]["attempted_states"]
                     if payload["result"] is not None else 0
                 )
-                accepted = process_framework_result(
+                action = process_framework_result(
                     payload["parent_index"], payload["result"]
                 )
-                if not accepted:
-                    manager_failed += 1
+                if action is False:
+                    manager_exhausted += 1
+                else:
+                    manager_valid += 1
+                    if action in {"fill", "swap"}:
+                        manager_retained += 1
+                    else:
+                        manager_nonimproving += 1
                 if payload["error"]:
                     manager_errors += 1
-                elapsed = time.perf_counter() - manager_start
-                rate = manager_completed / max(elapsed, 1e-9)
-                print(
-                    f"Sampling round {sample_round}: O manager "
-                    f"{manager_completed}/{len(confirmed_row_positions)}, "
-                    f"accepted={sequential_passed}, failed={manager_failed}, "
-                    f"running=0, rate={rate:.2f}/s, elapsed={elapsed:.1f}s",
-                    flush=True,
-                )
-                if accepted_count + len(accepted_this_round) >= args.sample:
+                if pool.convergence_reason is not None:
                     break
         else:
             task_iter = iter(search_tasks)
@@ -2755,7 +3492,6 @@ def main():
                 future = o_executor.submit(_search_one_si_framework, task)
                 running[future] = task[0]
 
-            last_reported = manager_completed
             stop_submitting = False
             while running:
                 done, _ = wait(tuple(running), return_when=FIRST_COMPLETED)
@@ -2766,15 +3502,21 @@ def main():
                     result = payload["result"]
                     if result is not None:
                         total_o_proposals += int(result["attempted_states"])
-                    accepted = process_framework_result(
+                    action = process_framework_result(
                         payload["parent_index"], result
                     )
-                    if not accepted:
-                        manager_failed += 1
+                    if action is False:
+                        manager_exhausted += 1
+                    else:
+                        manager_valid += 1
+                        if action in {"fill", "swap"}:
+                            manager_retained += 1
+                        else:
+                            manager_nonimproving += 1
                     if payload["error"]:
                         manager_errors += 1
 
-                    if accepted_count + len(accepted_this_round) >= args.sample:
+                    if pool.convergence_reason is not None:
                         stop_submitting = True
                     if not stop_submitting:
                         task = next(task_iter, None)
@@ -2782,80 +3524,83 @@ def main():
                             new_future = o_executor.submit(_search_one_si_framework, task)
                             running[new_future] = task[0]
 
-                if (
-                    manager_completed - last_reported >= progress_step
-                    or not running
-                    or stop_submitting
-                ):
-                    elapsed = time.perf_counter() - manager_start
-                    rate = manager_completed / max(elapsed, 1e-9)
-                    print(
-                        f"Sampling round {sample_round}: O manager "
-                        f"{manager_completed}/{len(confirmed_row_positions)}, "
-                        f"accepted={sequential_passed}, failed={manager_failed}, "
-                        f"running={len(running)}, rate={rate:.2f}/s, "
-                        f"elapsed={elapsed:.1f}s",
-                        flush=True,
-                    )
-                    last_reported = manager_completed
-
                 if stop_submitting:
                     for future in running:
                         future.cancel()
                     break
 
         timing["cpu_o_expansion"] += time.perf_counter() - manager_start
-        if manager_errors:
-            print(
-                f"Sampling round {sample_round}: O manager worker_errors={manager_errors}",
-                flush=True,
-            )
-
         sequential_total_states += sequential_attempted
         sequential_completed_total += sequential_completed
         exhausted_si_total += len(unresolved)
-        if accepted_this_round:
-            round_rows = pd.concat(
-                [item[2] for item in accepted_this_round], ignore_index=True
-            )
-            # Never exceed the exact final output count.
-            n_take = min(len(round_rows), args.sample - accepted_count)
-            if n_take < len(round_rows):
-                raise RuntimeError(
-                    "Internal fixed-Si proposal logic accepted more structures "
-                    "than the remaining output quota."
-                )
-            accepted_batches.append(round_rows.iloc[:n_take].copy())
-            accepted_count += n_take
-            nn_selected_total += n_take
+        accepted_count = len(pool)
+        nn_selected_total = pool.fill_accepts + pool.swap_accepts
 
         nn_summary = density_selector.accepted_summary()
         ionic_round = ionic_target.summary(scope="accepted")
-        metric_line = (
-            f"SiO={ionic_round['sio']['mean']:.3f}/"
-            f"{ionic_round['sio']['std']:.3f},TV={ionic_round['sio']['tv']:.3f} "
-            f"OO={ionic_round['oo']['mean']:.3f}/"
-            f"{ionic_round['oo']['std']:.3f},TV={ionic_round['oo']['tv']:.3f}"
+        adaptive = pool.adaptive_status()
+        weights = adaptive["weights"]
+        round_seconds = time.perf_counter() - round_start
+        construction_rate = (
+            manager_completed / max(time.perf_counter() - manager_start, 1.0e-9)
         )
+        valid_yield = manager_valid / max(manager_completed, 1)
+        retained_actions = sum(
+            1 for _, decision in accepted_this_round
+            if decision["action"] in {"fill", "swap"}
+        )
+        fill_actions = sum(
+            1 for _, decision in accepted_this_round
+            if decision["action"] == "fill"
+        )
+        swap_actions = sum(
+            1 for _, decision in accepted_this_round
+            if decision["action"] == "swap"
+        )
+        reject_actions = sum(
+            1 for _, decision in accepted_this_round
+            if decision["action"] == "reject"
+        )
+        integrity_reject_actions = sum(
+            1 for _, decision in accepted_this_round
+            if decision["action"] == "integrity_reject"
+        )
+        if adaptive["window_ready"]:
+            convergence_text = (
+                f"window_gain={adaptive['window_relative_gain']:.3%}, "
+                f"window_swaps={adaptive['window_swaps']}/"
+                f"{pool.convergence_max_swaps}, "
+                f"postfill={pool.postfill_candidates}/"
+                f"{adaptive['maximum_postfill']}"
+            )
+        else:
+            history_count = max(len(pool.monitor_history) - 1, 0)
+            convergence_text = (
+                f"window={history_count}/{adaptive['window']}, "
+                f"postfill={pool.postfill_candidates}/"
+                f"{adaptive['minimum_postfill']} "
+                f"(hard_cap={adaptive['maximum_postfill']})"
+            )
+
         print(
-            f"Sampling round {sample_round}: generated_Si={draw_size}, "
-            f"Si_rows={len(si_rows)}, safety_valid={safety_valid}, "
-            f"confirmed_Si={len(confirmed_row_positions)}, "
-            f"O_accepted={len(accepted_this_round)}, O_exhausted={len(unresolved)}, "
-            f"O_proposals_total={total_o_proposals}, "
-            f"cumulative={accepted_count}/{args.sample}, "
-            f"NN_TV={density_selector.histogram_distance():.4f}, "
-            f"NN_mean/std={nn_summary['mean']:.3f}/{nn_summary['std']:.3f} A; "
-            f"Ionic target accepted={ionic_target.accepted_structures}\n"
-            f"  accepted pooled metrics: {metric_line}\n"
-            f"  Sequential O construction: completed={sequential_completed}/{len(confirmed_row_positions)}, "
-            f"passed={sequential_passed}, attempted_orbit_states={sequential_attempted}, "
-            f"mean_constructive_score={np.mean(sequential_scores) if sequential_scores else np.nan:.4f}\n"
-            f"  Guided proposals: attempted={proposal_stats_round['guided_attempted']}, "
-            f"valid={proposal_stats_round['guided_valid']}, retained={proposal_stats_round['guided_retained']}; "
-            f"exploratory attempted={proposal_stats_round['explore_attempted']}, "
-            f"valid={proposal_stats_round['explore_valid']}, retained={proposal_stats_round['explore_retained']}; "
-            f"Cached probes valid={proposal_stats_round['probe_valid']}/{proposal_stats_round['probe_total']}",
+            f"Sampling round {sample_round} [{phase}] | "
+            f"time={round_seconds:.1f}s | pool={accepted_count}/{args.sample} | "
+            f"Ti generated/reconstructed/safe/selected="
+            f"{draw_size}/{len(si_rows)}/{safety_valid}/{len(confirmed_row_positions)}\n"
+            f"  O processed/valid/exhausted/errors="
+            f"{manager_completed}/{manager_valid}/{manager_exhausted}/{manager_errors} "
+            f"({valid_yield:.1%} valid, {construction_rate:.2f}/s) | "
+            f"pool fill/swap/reject/integrity_reject="
+            f"{fill_actions}/{swap_actions}/{reject_actions}/{integrity_reject_actions} | "
+            f"orbit_states={sequential_attempted}\n"
+            f"  Loss adaptive/monitor={pool.loss:.6f}/{pool.monitor_loss:.6f} | "
+            f"TV NN/TiO/OO={adaptive['nn_tv']:.4f}/"
+            f"{adaptive['sio_tv']:.4f}/{adaptive['oo_tv']:.4f} | "
+            f"weights={weights['nn']:.3f}/{weights['sio']:.3f}/"
+            f"{weights['oo']:.3f} | topology={adaptive.get('topology_loss', float('nan')):.4f}\n"
+            f"  guard={adaptive['guard_fraction']:.2%} | "
+            f"min_improvement={adaptive['required_improvement']:.3e} | "
+            f"{convergence_text} | total_O_proposals={total_o_proposals}",
             flush=True,
         )
 
@@ -2864,16 +3609,16 @@ def main():
     if o_executor is not None:
         o_executor.shutdown(wait=True, cancel_futures=True)
 
+    accepted_count = len(pool)
     if accepted_count < args.sample:
         acceptance = accepted_count / total_generated if total_generated else 0.0
         raise RuntimeError(
-            "Could not obtain the requested number of samples that fit the "
-            f"original {num_wps}-slot LEGO layout after {args.max_sample_rounds} "
-            f"rounds: accepted {accepted_count}/{args.sample}; "
+            "Could not fill the requested fixed-capacity output pool after "
+            f"{args.max_sample_rounds} rounds: filled {accepted_count}/{args.sample}; "
             f"acceptance={acceptance:.1%}."
         )
 
-    synthetic = pd.concat(accepted_batches, ignore_index=True).iloc[: args.sample].copy()
+    synthetic = pool.rows().iloc[: args.sample].copy()
     synthetic = restore_dtypes(
         synthetic,
         canonical_df,
@@ -2892,12 +3637,22 @@ def main():
         f"    invalid sampled Si skeleton: {mask_totals['invalid_si_skeleton']}\n"
         f"    no Si skeleton passing external feasibility gate: "
         f"{mask_totals['no_packing_feasible_si_skeleton']}\n"
-        f"    Si rows using externally conditioned coordinates: "
+        f"    Ti rows using externally conditioned coordinates: "
         f"{mask_totals['packing_conditioned_si_coordinates']}\n"
         f"    no compatible O skeleton: {mask_totals['no_compatible_o_skeleton']}\n"
         f"  Rejected slot-overflow combinations: {rejected_overflow}\n"
         f"  Rejected Wyckoff reconstructions: {rejected_reconstruction}\n"
-        f"  Retained fraction: {accepted_count / total_generated:.1%}"
+        f"  Retained fraction: {accepted_count / total_generated:.1%}\n"
+        f"  Complete valid candidates considered by pool: {pool.complete_candidates}\n"
+        f"  Initial fill accepts: {pool.fill_accepts}\n"
+        f"  Accepted replacements: {pool.swap_accepts}\n"
+        f"  Rejected replacements: {pool.rejections}\n"
+        f"  Final pool loss: {pool.loss:.6f}\n"
+        f"  Post-fill complete candidates: {pool.postfill_candidates}\n"
+        f"  Adaptive monitor loss: {pool.monitor_loss:.6f}\n"
+        f"  Convergence window: {pool.convergence_window}\n"
+        f"  Minimum post-fill candidates: {pool.minimum_postfill_candidates}\n"
+        f"  Hard post-fill cap: {pool.maximum_postfill_candidates}"
     )
 
     nn_diagnostics = os.path.join(
@@ -2907,10 +3662,10 @@ def main():
     raw_summary = density_selector.summarize_values(density_selector.raw_values)
     accepted_summary = density_selector.accepted_summary()
     print(
-        "Online per-Si nearest-neighbour probability selection:\n"
+        "Online per-Ti nearest-neighbour probability selection:\n"
         f"  Safety-valid candidates: {nn_safety_valid}\n"
-        f"  Rejected terminal Si-Si contacts: {density_selector.rejected_safety}\n"
-        f"  Failed Si geometry expansions: {density_selector.failed_geometry}\n"
+        f"  Rejected terminal Ti-Ti contacts: {density_selector.rejected_safety}\n"
+        f"  Failed Ti geometry expansions: {density_selector.failed_geometry}\n"
         f"  NN-probability-selected structures: {nn_selected_total}\n"
         f"  Raw histogram TV distance: "
         f"{density_selector.histogram_distance(density_selector.raw_counts):.4f}\n"
@@ -2935,17 +3690,17 @@ def main():
     pd.DataFrame(timing_rows).to_csv(timing_path, index=False)
     print(
         "Pooled ionic-distance construction:\n"
-        f"  Confirmed Si frameworks: {confirmed_si_total}\n"
+        f"  Confirmed Ti frameworks: {confirmed_si_total}\n"
         f"  Completed constructive searches: {sequential_completed_total}\n"
         f"  Evaluated orbit states: {sequential_total_states}\n"
         f"  Accepted structures: {ionic_target.accepted_structures}\n"
-        f"  Si-O target mu/sigma: {ionic_target.mu['sio']:.4f}/"
+        f"  Ti-O target mu/sigma: {ionic_target.mu['sio']:.4f}/"
         f"{ionic_target.sigma['sio']:.4f} A\n"
         f"  O-O target mu/sigma: {ionic_target.mu['oo']:.4f}/"
         f"{ionic_target.sigma['oo']:.4f} A\n"
-        f"  Raw Si-O mean/std/TV: {raw_ionic['sio']['mean']:.4f}/"
+        f"  Raw Ti-O mean/std/TV: {raw_ionic['sio']['mean']:.4f}/"
         f"{raw_ionic['sio']['std']:.4f}/{raw_ionic['sio']['tv']:.4f}\n"
-        f"  Accepted Si-O mean/std/TV: {accepted_ionic['sio']['mean']:.4f}/"
+        f"  Accepted Ti-O mean/std/TV: {accepted_ionic['sio']['mean']:.4f}/"
         f"{accepted_ionic['sio']['std']:.4f}/{accepted_ionic['sio']['tv']:.4f}\n"
         f"  Raw O-O mean/std/TV: {raw_ionic['oo']['mean']:.4f}/"
         f"{raw_ionic['oo']['std']:.4f}/{raw_ionic['oo']['tv']:.4f}\n"
@@ -2954,9 +3709,20 @@ def main():
         f"  Timing: {timing_path}"
     )
 
+    integrity_path = os.path.join(model_folder, "tio2_integrity_candidates.csv")
+    pd.DataFrame(integrity_evaluator.records).to_csv(integrity_path, index=False)
+    print(
+        "TiO6/OTi3 integrity selection:\n"
+        f"  Checked complete candidates: {integrity_evaluator.checked}\n"
+        f"  Integrity-valid candidates: {integrity_evaluator.valid}\n"
+        f"  Valid fraction: {integrity_evaluator.valid / max(integrity_evaluator.checked, 1):.1%}\n"
+        f"  Topology weight: {args.pool_topology_weight:g}\n"
+        f"  Diagnostics: {integrity_path}"
+    )
+
     output = os.path.join(
         sample_folder,
-        f"{data_name}-FactorizedVAE-v40-cached-ionic-field-seed{args.seed}-{args.sample}.csv",
+        f"{data_name}-FactorizedVAE-tio2-v1-cached-ionic-field-seed{args.seed}-{args.sample}.csv",
     )
     synthetic.to_csv(output, index=False)
     final_model = os.path.join(model_folder, "models", "FactorizedVAE_final.pkl")
