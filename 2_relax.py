@@ -1,363 +1,240 @@
 #!/usr/bin/env python3
-"""Finalize factorized SiO2 samples with direct SO3 relaxation and GULP ranking.
+"""Juliette TiO2 relaxation v3.4 for floating-octahedra v33 output.
 
-Pipeline
---------
-CSV -> strict PyXtal decoding -> cheap exact-representation deduplication
-    -> direct element-specific SO3 optimization -> SO3-energy selection
-    -> symmetry-constrained GULP relaxation -> parallel StructureMatcher deduplication
-    -> candidates ranked by eV/atom.
+Pipeline:
+    v33 ranked CIF ingestion (raw CIF is authoritative)
+    -> exact PyXtal-representation deduplication
+    -> raw SO3 diagnostic
+    -> optional full-representation single-rutile SO3 refinement (lattice + Wyckoff coordinates)
+    -> raw/SO3 displacement and chemistry comparison
+    -> final-stage StructureMatcher deduplication on raw/SO3 structures
+    -> strict training-database overlap comparison
 
-The legacy target_coord columns are used only to identify Si and O slots in the
-current CSV representation. They are not used as coordination constraints,
-coordination filters, or SO3-reference selectors.
+No tabular wp/x/y/z decoder or GULP/ReaxFF relaxation is used. The finalized
+v33 files ``pre_joint_tio2/sample_XXXXXX.cif`` are consumed directly and
+matched to ``floating_builder_selected.csv`` by zero-based sample index /
+one-based ``final_rank``. SO3 similarity is diagnostic/refinement only and is
+never used to rank distinct candidates.
 """
-
 from __future__ import annotations
 
 import argparse
 import hashlib
 import json
 import math
+import multiprocessing as mp
+from multiprocessing import Pool
 import os
 import shutil
 from collections import Counter, defaultdict
+from copy import deepcopy
 from pathlib import Path
 from time import time
 
-# Multiprocessing provides the parallelism. Prevent every worker from also
-# spawning a full BLAS/OpenMP thread team. Users may override these explicitly.
-os.environ.setdefault("OMP_NUM_THREADS", "1")
-os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
-os.environ.setdefault("MKL_NUM_THREADS", "1")
-os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+for _key in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+    os.environ.setdefault(_key, "1")
 
 import numpy as np
 import pandas as pd
+import torch
+from scipy.optimize import linear_sum_assignment, minimize
+from ase import Atoms
+from ase.io import read as ase_read, write as ase_write
 from ase.db import connect
 from pyxtal import pyxtal
+from pyxtal.lattice import Lattice
 from pymatgen.analysis.structure_matcher import ElementComparator, StructureMatcher
 from pymatgen.core import Structure
+from pymatgen.io.vasp import Poscar
+from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
 from pymatgen.io.ase import AseAtomsAdaptor
-from pyxtal.db import database_topology
-from pyxtal.lattice import Lattice
-from pyxtal.symmetry import Group
 from tqdm import tqdm
 
 from lego.builder import builder
+from lego.util import calculate_S
 
 
-BASE_COLUMNS = ["spg", "a", "b", "c", "alpha", "beta", "gamma"]
-SPECIES_FROM_LEGACY_LABEL = {4: "Si", 2: "O"}
+CHEMISTRY_CUTOFF = 5.0
+TIO_CUTOFF = 3.0
+ANGLE_BINS = np.linspace(0.0, 180.0, 10)
+OO_BINS = np.linspace(0.0, 6.0, 13)
+SHIFTS = np.asarray(
+    [[i, j, k] for i in (-1, 0, 1) for j in (-1, 0, 1) for k in (-1, 0, 1)],
+    dtype=float,
+)
+ZERO_SHIFT = int(np.flatnonzero(np.all(SHIFTS == 0, axis=1))[0])
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Direct-SO3 relaxation and GULP ranking for factorized SiO2 samples."
-    )
-    parser.add_argument("--csv", required=True, help="Factorized sampled CSV.")
-    parser.add_argument("--reference-sio2", required=True, help="Reference SiO2 CIF, e.g. alpha_quartz.cif.")
-    parser.add_argument("--output-dir", default=None)
-    parser.add_argument("--begin", type=int, default=0)
-    parser.add_argument("--end", type=int, default=-1)
-    parser.add_argument("--ncpu", type=int, default=1)
-    parser.add_argument("--rcut", type=float, default=3.0)
-    parser.add_argument(
-        "--max-so3-energy",
-        type=float,
-        default=float("inf"),
-        help=(
-            "Optional maximum final SO3 objective passed to GULP. "
-            "The default is 'inf', so every successfully SO3-relaxed structure "
-            "is passed to GULP."
-        ),
-    )
-    parser.add_argument(
-        "--so3-stop-energy",
-        type=float,
-        default=100.0,
-        help=(
-            "Stop the remaining SO3 minimizer stages once this objective is "
-            "reached. This accelerates relaxation but does not filter the "
-            "GULP handoff. Default: 100."
-        ),
-    )
-    parser.add_argument(
-        "--max-initial-so3-energy",
-        type=float,
-        default=float("inf"),
-        help=(
-            "Skip expensive SO3 optimization when the initial per-atom SO3 "
-            "objective exceeds this value. Use 'inf' to disable. Default: 1000."
-        ),
-    )
-    parser.add_argument(
-        "--nm-steps",
-        type=int,
-        default=50,
-        help="Maximum Nelder-Mead iterations in the fast SO3 schedule.",
-    )
-    parser.add_argument(
-        "--lbfgs-steps",
-        type=int,
-        default=150,
-        help="Maximum L-BFGS-B iterations after Nelder-Mead.",
-    )
-    parser.add_argument("--ff-lib", default="reaxff", help="GULP force-field library name/path.")
-    parser.add_argument("--skip-gulp", action="store_true")
-    parser.add_argument(
-        "--dedup-decimals",
-        type=int,
-        default=8,
-        help="Decimal precision for cheap pre-SO3 representation deduplication.",
-    )
-    parser.add_argument(
-        "--match-ltol", type=float, default=0.20,
-        help="StructureMatcher fractional lattice tolerance. Default: 0.20.",
-    )
-    parser.add_argument(
-        "--match-stol", type=float, default=0.30,
-        help="StructureMatcher normalized site tolerance. Default: 0.30.",
-    )
-    parser.add_argument(
-        "--match-angle-tol", type=float, default=5.0,
-        help="StructureMatcher angle tolerance in degrees. Default: 5.",
-    )
-    parser.add_argument(
-        "--match-energy-window", type=float, default=0.05,
-        help=(
-            "Cheap pair prefilter in eV/atom before direct structure matching. "
-            "It never defines a duplicate. Use 'inf' to disable. Default: 0.05."
-        ),
-    )
-    parser.add_argument(
-        "--match-volume-tol", type=float, default=0.25,
-        help=(
-            "Cheap relative volume-per-atom prefilter before StructureMatcher. "
-            "It never defines a duplicate. Use 'inf' to disable. Default: 0.25."
-        ),
-    )
-    parser.add_argument(
-        "--match-chunksize", type=int, default=8,
-        help="Multiprocessing chunksize for pairwise StructureMatcher calls.",
-    )
-    parser.add_argument(
-        "--training-db",
-        default=None,
-        help=(
-            "Optional ASE database containing the training/reference structures. "
-            "Post-GULP unique candidates are compared directly against this database."
-        ),
-    )
-    parser.add_argument(
-        "--skip-training-overlap",
-        action="store_true",
-        help="Skip comparison of final unique candidates against --training-db.",
-    )
-    return parser.parse_args()
+# -----------------------------------------------------------------------------
+# Resources
+# -----------------------------------------------------------------------------
 
-
-def discover_site_indices(df: pd.DataFrame) -> list[int]:
-    indices = []
-    i = 0
-    while f"wp{i}" in df.columns:
-        required = [f"wp{i}", f"x{i}", f"y{i}", f"z{i}", f"target_coord{i}"]
-        missing = [name for name in required if name not in df.columns]
-        if missing:
-            raise ValueError(f"Missing columns for slot {i}: {missing}")
-        indices.append(i)
-        i += 1
-    if not indices:
-        raise ValueError("No contiguous wp0, wp1, ... site columns were found.")
-    extra = [
-        name for name in df.columns
-        if name.startswith("wp") and name[2:].isdigit() and int(name[2:]) not in indices
-    ]
-    if extra:
-        raise ValueError(f"Non-contiguous Wyckoff slots found: {sorted(extra)}")
-    return indices
-
-
-def infer_representation_mode(df: pd.DataFrame) -> tuple[bool, int | None, bool]:
-    coordinate_max = pd.to_numeric(df["x0"], errors="coerce").max()
-    if coordinate_max < 5 + 1e-3:
-        discrete, resolution = False, None
-    elif coordinate_max < 50 + 1e-3:
-        discrete, resolution = True, 50
-    else:
-        discrete, resolution = True, 100
-
-    first_a = float(df["a"].iloc[0])
-    first_c = float(df["c"].iloc[0])
-    discrete_cell = (
-        abs(first_a - round(first_a)) < 1e-6
-        and abs(first_c - round(first_c)) < 1e-6
-    )
-    return discrete, resolution, discrete_cell
-
-
-def requested_sites(row: dict, indices: list[int]) -> list[dict]:
-    records = []
-    seen_empty = False
-    for slot in indices:
-        wp_index = int(round(float(row[f"wp{slot}"])))
-        legacy_label = int(round(float(row[f"target_coord{slot}"])))
-        if wp_index == -1:
-            seen_empty = True
-            if legacy_label != 0:
-                raise ValueError(f"slot {slot}: empty site requires target_coord=0")
-            continue
-        if seen_empty:
-            raise ValueError(f"slot {slot}: occupied site follows an empty slot")
-        if legacy_label not in SPECIES_FROM_LEGACY_LABEL:
-            raise ValueError(
-                f"slot {slot}: target_coord is used only as a Si/O label and must be 4 or 2; got {legacy_label}"
-            )
-        records.append(
-            {
-                "slot": slot,
-                "wp_index": wp_index,
-                "species": SPECIES_FROM_LEGACY_LABEL[legacy_label],
-                "position": np.mod(
-                    np.asarray([row[f"x{slot}"], row[f"y{slot}"], row[f"z{slot}"]], dtype=float),
-                    1.0,
-                ),
-            }
-        )
-    if not records:
-        raise ValueError("row contains no occupied independent sites")
-    return records
-
-
-def periodic_fractional_distance(a: np.ndarray, b: np.ndarray) -> float:
-    delta = np.abs(np.asarray(a) - np.asarray(b))
-    delta = np.minimum(delta, 1.0 - delta)
-    return float(np.linalg.norm(delta))
-
-
-def build_sio2(
-    row: dict,
-    indices: list[int],
-    discrete: bool,
-    resolution: int | None,
-    discrete_cell: bool,
-) -> tuple[pyxtal, np.ndarray, list[dict]]:
-    records = requested_sites(row, indices)
-    rep_values = [row[name] for name in BASE_COLUMNS]
-    for slot in indices:
-        rep_values.extend([row[f"wp{slot}"], row[f"x{slot}"], row[f"y{slot}"], row[f"z{slot}"]])
-    rep = np.asarray(rep_values, dtype=float)
-
-    number = int(round(float(row["spg"])))
-    if not 1 <= number <= 230:
-        raise ValueError(f"invalid space-group number {number}")
-    group = Group(number)
-
-    a, b, c, alpha, beta, gamma = [float(row[name]) for name in BASE_COLUMNS[1:]]
-    if discrete_cell:
-        if resolution is None:
-            raise ValueError("discrete cell detected without a grid resolution")
-        a, b, c = [value / resolution * 50.0 for value in (a, b, c)]
-        alpha, beta, gamma = [value / resolution * 180.0 for value in (alpha, beta, gamma)]
-    else:
-        alpha, beta, gamma = np.degrees([alpha, beta, gamma])
-
-    lattice = Lattice.from_para(
-        a, b, c, alpha, beta, gamma,
-        ltype=group.lattice_type,
-        force_symmetry=True,
-    )
-
-    sites = {"Si": [], "O": []}
-    multiplicities = {"Si": 0, "O": 0}
-    expected = []
-    for record in records:
-        wp_index = record["wp_index"]
-        if wp_index < 0 or wp_index >= len(group):
-            raise ValueError(f"slot {record['slot']}: invalid Wyckoff index {wp_index}")
-        wp = group[wp_index]
-        xyz = record["position"].copy()
-        if discrete:
-            if resolution is None:
-                raise ValueError("discrete coordinates detected without a grid resolution")
-            xyz = np.asarray(wp.from_discrete_grid(xyz.tolist(), resolution), dtype=float)
-        generator = wp.search_generator(
-            xyz.tolist(),
-            tol=0.1 if discrete else 0.01,
-            symmetrize=True,
-        )
-        if generator is None:
-            raise ValueError(f"slot {record['slot']}: Wyckoff generator search failed")
-        generator = np.mod(np.asarray(generator, dtype=float), 1.0)
-        symbol = record["species"]
-        label = wp.get_label()
-        sites[symbol].append((label, *[float(value) for value in generator]))
-        multiplicities[symbol] += int(wp.multiplicity)
-        expected.append({**record, "wp_label": label, "generator": generator})
-
-    if not sites["Si"] or not sites["O"]:
-        raise ValueError("decoding lost the Si or O sublattice")
-    if multiplicities["O"] != 2 * multiplicities["Si"]:
-        raise ValueError(
-            f"Wyckoff multiplicities are not SiO2: Si={multiplicities['Si']} O={multiplicities['O']}"
-        )
-
-    xtal = pyxtal()
-    xtal.build(
-        group,
-        ["Si", "O"],
-        [multiplicities["Si"], multiplicities["O"]],
-        lattice,
-        [sites["Si"], sites["O"]],
-    )
-    if not xtal.valid or not xtal.atom_sites:
-        raise ValueError("PyXtal returned an invalid or empty structure")
-    if int(xtal.group.number) != number:
-        raise ValueError(f"space group changed during decoding: {number} -> {xtal.group.number}")
-    if len(xtal.atom_sites) != len(expected):
-        raise ValueError(
-            f"independent-site count changed: requested={len(expected)} decoded={len(xtal.atom_sites)}"
-        )
-
-    # Strict one-to-one species/Wyckoff/generator matching.
-    available = list(range(len(expected)))
-    for site in xtal.atom_sites:
-        symbol = str(site.specie)
-        label = site.wp.get_label()
-        position = np.mod(np.asarray(site.position, dtype=float), 1.0)
-        candidates = [
-            idx for idx in available
-            if expected[idx]["species"] == symbol and expected[idx]["wp_label"] == label
-        ]
-        if not candidates:
-            raise ValueError(f"decoded site {symbol} {label} cannot be mapped to a requested site")
-        chosen = min(candidates, key=lambda idx: periodic_fractional_distance(position, expected[idx]["generator"]))
-        if periodic_fractional_distance(position, expected[chosen]["generator"]) > 0.05:
-            raise ValueError(f"decoded generator moved unexpectedly for {symbol} {label}")
-        available.remove(chosen)
-    if available:
-        raise ValueError(f"unmatched requested independent sites: {available}")
-
-    composition = dict(zip(map(str, xtal.species), map(int, xtal.numIons)))
-    if composition.get("Si", 0) <= 0 or composition.get("O", 0) != 2 * composition.get("Si", 0):
-        raise ValueError(f"decoded structure is not SiO2: {composition}")
-    return xtal, rep, expected
-
-
-def decode_one(payload):
-    row_index, row, indices, discrete, resolution, discrete_cell = payload
+def _cpu_affinity_count() -> int:
     try:
-        xtal, rep, expected = build_sio2(row, indices, discrete, resolution, discrete_cell)
-        return row_index, xtal, rep, expected, None
-    except Exception as exc:
-        return row_index, None, None, None, f"{type(exc).__name__}: {exc}"
+        return max(1, len(os.sched_getaffinity(0)))
+    except (AttributeError, OSError):
+        return max(1, int(os.cpu_count() or 1))
+
+
+def resolve_ncpu(requested: int | None, reserve_for_scheduler: int = 1) -> int:
+    affinity = _cpu_affinity_count()
+    slurm_raw = os.environ.get("SLURM_CPUS_PER_TASK")
+    try:
+        allocated = int(slurm_raw) if slurm_raw is not None else affinity
+    except ValueError:
+        allocated = affinity
+    allocated = max(1, min(allocated, affinity))
+    requested = 0 if requested is None else int(requested)
+    if requested < 0:
+        raise ValueError("--ncpu cannot be negative")
+    if requested == 0:
+        return max(1, allocated - max(0, int(reserve_for_scheduler)))
+    return max(1, min(requested, allocated))
+
+
+
+def set_worker_thread_limits() -> None:
+    for key in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+        os.environ.setdefault(key, "1")
+    torch.set_num_threads(1)
+
+
+
+# -----------------------------------------------------------------------------
+# v33 output ingestion and exact pre-SO3 deduplication
+# -----------------------------------------------------------------------------
+
+def _metadata_value(meta: dict, key: str):
+    value = meta.get(key)
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    return value
+
+
+def load_v33_candidates(
+    generation_dir: Path,
+    cif_dir: Path | None,
+    selected_metrics: Path | None,
+):
+    generation_dir = generation_dir.resolve()
+    cif_dir = (cif_dir or generation_dir / "pre_joint_tio2").resolve()
+    selected_metrics = (
+        selected_metrics or generation_dir / "floating_builder_selected.csv"
+    ).resolve()
+
+    if not cif_dir.is_dir():
+        raise FileNotFoundError(cif_dir)
+    if not selected_metrics.is_file():
+        raise FileNotFoundError(selected_metrics)
+
+    meta_df = pd.read_csv(selected_metrics)
+    if "final_rank" not in meta_df.columns:
+        raise ValueError(
+            f"{selected_metrics} has no final_rank column and cannot be mapped "
+            "to v33 sample_XXXXXX.cif files"
+        )
+    if meta_df["final_rank"].duplicated().any():
+        duplicates = sorted(
+            meta_df.loc[meta_df["final_rank"].duplicated(False), "final_rank"]
+            .astype(int)
+            .unique()
+            .tolist()
+        )
+        raise ValueError(f"Duplicate final_rank values in selected metadata: {duplicates}")
+
+    rows_by_rank = {
+        int(row["final_rank"]): row.to_dict()
+        for _, row in meta_df.iterrows()
+    }
+
+    cif_paths = sorted(cif_dir.glob("sample_*.cif"))
+    if not cif_paths:
+        raise FileNotFoundError(f"No sample_*.cif files found in {cif_dir}")
+
+    candidates = []
+    failures = []
+    for cif_path in cif_paths:
+        stem = cif_path.stem
+        try:
+            sample_index = int(stem.rsplit("_", 1)[1])
+        except Exception:
+            failures.append(
+                {
+                    "cif_path": str(cif_path),
+                    "failure_stage": "filename",
+                    "error": "Cannot parse zero-based sample index from CIF filename",
+                }
+            )
+            continue
+
+        final_rank = sample_index + 1
+        meta = rows_by_rank.get(final_rank)
+        if meta is None:
+            failures.append(
+                {
+                    "cif_path": str(cif_path),
+                    "source_row": sample_index,
+                    "final_rank": final_rank,
+                    "failure_stage": "metadata",
+                    "error": "No matching final_rank in floating_builder_selected.csv",
+                }
+            )
+            continue
+
+        try:
+            atoms = ase_read(cif_path)
+            xtal = pyxtal()
+            xtal.from_seed(atoms)
+            if xtal is None or not xtal.valid or not xtal.atom_sites:
+                raise ValueError("PyXtal symmetry reconstruction returned an invalid structure")
+            xtal.tag = {
+                "source_row": int(sample_index),
+                "final_rank": int(final_rank),
+                "candidate_id": _metadata_value(meta, "candidate_id"),
+                "raw_cif_path": str(cif_path),
+            }
+            detected_spg = int(xtal.group.number)
+            generated_spg = int(meta["spg"]) if _metadata_value(meta, "spg") is not None else None
+            candidates.append(
+                {
+                    "source_row": int(sample_index),
+                    "final_rank": int(final_rank),
+                    "candidate_id": _metadata_value(meta, "candidate_id"),
+                    "cif_path": cif_path,
+                    "atoms": atoms,
+                    "xtal": xtal,
+                    "meta": meta,
+                    "generated_spg": generated_spg,
+                    "detected_spg": detected_spg,
+                    "spg_agrees": (
+                        None if generated_spg is None else bool(generated_spg == detected_spg)
+                    ),
+                }
+            )
+        except Exception as exc:
+            failures.append(
+                {
+                    "cif_path": str(cif_path),
+                    "source_row": sample_index,
+                    "final_rank": final_rank,
+                    "failure_stage": "cif_ingestion",
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+
+    candidates.sort(key=lambda item: item["source_row"])
+    return candidates, failures, selected_metrics, cif_dir
 
 
 def representation_key(xtal: pyxtal, decimals: int) -> str:
     x = np.round(np.asarray(xtal.get_1d_rep_x(), dtype=float), decimals).tolist()
     site_signature = [
-        (str(site.specie), site.wp.get_label())
-        for site in xtal.atom_sites
+        (str(site.specie), site.wp.get_label()) for site in xtal.atom_sites
     ]
     payload = {
         "spg": int(xtal.group.number),
@@ -368,107 +245,725 @@ def representation_key(xtal: pyxtal, decimals: int) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-def deduplicate(decoded: list[tuple], decimals: int):
-    groups: dict[str, list[tuple]] = defaultdict(list)
-    for item in decoded:
-        groups[representation_key(item[1], decimals)].append(item)
+def deduplicate_raw_candidates(candidates: list[dict], decimals: int):
+    groups = defaultdict(list)
+    for item in candidates:
+        groups[representation_key(item["xtal"], decimals)].append(item)
 
     unique = []
-    duplicate_rows = []
+    duplicates = []
     for key, members in groups.items():
-        members.sort(key=lambda item: item[0])
+        members.sort(key=lambda item: item["source_row"])
         representative = members[0]
-        source_rows = [int(item[0]) for item in members]
-        row_index, xtal, rep, expected, _ = representative
-        xtal.tag = {
-            "source_row": int(row_index),
-            "representative_source_row": int(row_index),
+        source_rows = [int(item["source_row"]) for item in members]
+        representative = dict(representative)
+        representative["source_rows"] = source_rows
+        representative["generation_count"] = len(source_rows)
+        representative["dedup_key"] = key
+        representative["xtal"].tag = {
+            **deepcopy(getattr(representative["xtal"], "tag", {}) or {}),
+            "representative_source_row": int(representative["source_row"]),
             "source_rows": source_rows,
             "generation_count": len(source_rows),
             "dedup_key": key,
         }
-        unique.append((row_index, xtal, rep, expected, source_rows, key))
-        for duplicate in source_rows[1:]:
-            duplicate_rows.append(
+        unique.append(representative)
+        for duplicate in members[1:]:
+            duplicates.append(
                 {
-                    "source_row": duplicate,
-                    "representative_source_row": int(row_index),
+                    "source_row": int(duplicate["source_row"]),
+                    "representative_source_row": int(representative["source_row"]),
                     "status": "duplicate_before_so3",
                     "dedup_key": key,
                 }
             )
-    unique.sort(key=lambda item: item[0])
-    duplicate_rows.sort(key=lambda item: item["source_row"])
-    return unique, duplicate_rows
+
+    unique.sort(key=lambda item: item["source_row"])
+    return unique, duplicates
 
 
-def write_pre_so3_db(path: Path, unique: list[tuple], source_csv: str) -> None:
-    if path.exists():
-        path.unlink()
-    db = connect(path)
-    for row_index, xtal, rep, expected, source_rows, key in tqdm(unique, desc="Saving pre-SO3"):
-        db.write(
-            xtal.to_ase(resort=False),
-            stage="pre_so3",
-            source_csv=source_csv,
-            source_row=int(row_index),
-            representative_source_row=int(row_index),
-            generation_count=len(source_rows),
-            source_rows_json=json.dumps(source_rows, separators=(",", ":")),
-            dedup_key=key,
-            data={
-                "representation": rep.tolist(),
-                "requested_sites": [
-                    {
-                        "slot": int(item["slot"]),
-                        "species": item["species"],
-                        "wp_index": int(item["wp_index"]),
-                        "wp_label": item["wp_label"],
-                    }
-                    for item in expected
-                ],
-            },
+def same_order_movement_metrics(reference_atoms: Atoms, stage_atoms: Atoms) -> dict:
+    """Measure internal motion and cell change.
+
+    For SO3, atom order is representation-preserving and the exact same-order
+    comparison is used.  A species-block Hungarian fallback is available for
+    relaxed structures whose writer reordered atoms.  Internal displacement is
+    measured after mapping both fractional coordinate sets through the raw cell,
+    so cell strain is reported separately rather than folded into atomic motion.
+    """
+    if len(reference_atoms) != len(stage_atoms):
+        raise ValueError(
+            f"atom count changed: {len(reference_atoms)} -> {len(stage_atoms)}"
         )
 
+    ref_symbols = np.asarray(reference_atoms.get_chemical_symbols(), dtype=object)
+    stage_symbols = np.asarray(stage_atoms.get_chemical_symbols(), dtype=object)
+    if Counter(ref_symbols.tolist()) != Counter(stage_symbols.tolist()):
+        raise ValueError("chemical composition changed")
 
-def copy_selected_so3_rows(source_db: Path, target_db: Path, max_so3: float) -> tuple[int, list[dict]]:
-    if target_db.exists():
-        target_db.unlink()
-    selected = 0
-    records = []
-    with connect(source_db) as src, connect(target_db) as dst:
-        for row in src.select():
-            sim = float(row.similarity) if hasattr(row, "similarity") else math.inf
-            accepted = math.isfinite(sim) and sim <= max_so3
-            record = {
-                "so3_db_row": int(row.id),
-                "source_row": int(row.source_row) if hasattr(row, "source_row") else None,
-                "representative_source_row": int(row.representative_source_row) if hasattr(row, "representative_source_row") else None,
-                "generation_count": int(row.generation_count) if hasattr(row, "generation_count") else 1,
-                "source_rows_json": row.source_rows_json if hasattr(row, "source_rows_json") else "[]",
-                "initial_so3_energy": float(row.similarity0),
-                "final_so3_energy": sim,
-                "passed_so3_filter": accepted,
+    ref_frac = np.asarray(reference_atoms.get_scaled_positions(wrap=True), dtype=float)
+    stage_frac = np.asarray(stage_atoms.get_scaled_positions(wrap=True), dtype=float)
+    ref_cell = np.asarray(reference_atoms.cell.array, dtype=float)
+    stage_cell = np.asarray(stage_atoms.cell.array, dtype=float)
+
+    if np.array_equal(ref_symbols, stage_symbols):
+        stage_ordered = stage_frac
+        assignment_mode = "same_order"
+    else:
+        stage_ordered = np.zeros_like(ref_frac)
+        assignment_mode = "species_hungarian"
+        for symbol in sorted(set(ref_symbols.tolist())):
+            ref_ids = np.flatnonzero(ref_symbols == symbol)
+            stage_ids = np.flatnonzero(stage_symbols == symbol)
+            delta = (
+                stage_frac[stage_ids][None, :, None, :]
+                - ref_frac[ref_ids][:, None, None, :]
+                + SHIFTS[None, None, :, :]
+            )
+            cart = np.einsum("...i,ij->...j", delta, ref_cell)
+            cost = np.linalg.norm(cart, axis=-1).min(-1)
+            rows, cols = linear_sum_assignment(cost)
+            stage_ordered[ref_ids[rows]] = stage_frac[stage_ids[cols]]
+
+    delta = stage_ordered - ref_frac
+    delta -= np.round(delta)
+    displacement = delta @ ref_cell
+    norms = np.linalg.norm(displacement, axis=1)
+
+    deformation = stage_cell @ np.linalg.inv(ref_cell)
+    strain_like = deformation - np.eye(3)
+    ref_volume = abs(float(np.linalg.det(ref_cell)))
+    stage_volume = abs(float(np.linalg.det(stage_cell)))
+
+    return {
+        "assignment_mode": assignment_mode,
+        "rms_displacement_A": float(np.sqrt(np.mean(norms**2))),
+        "mean_displacement_A": float(np.mean(norms)),
+        "max_displacement_A": float(np.max(norms)),
+        "cell_deformation_frobenius": float(np.linalg.norm(strain_like)),
+        "relative_volume_change": float(
+            (stage_volume - ref_volume) / max(ref_volume, 1e-12)
+        ),
+    }
+
+
+# -----------------------------------------------------------------------------
+# Chemistry descriptors
+# -----------------------------------------------------------------------------
+
+def _stable_logistic_switch(distances, cutoff, width):
+    scale = max(float(width), 0.03)
+    argument = np.clip(
+        (np.asarray(distances, dtype=float) - float(cutoff)) / scale,
+        -60.0,
+        60.0,
+    )
+    return 1.0 / (1.0 + np.exp(argument))
+
+
+def periodic_neighbor_vectors(frac, cell):
+    frac = np.asarray(frac, dtype=float)
+    delta = frac[:, None, None, :] - frac[None, :, None, :] + SHIFTS[None, None, :, :]
+    cart = np.einsum("...i,ij->...j", delta, cell)
+    dist = np.linalg.norm(cart, axis=-1)
+    ids = np.arange(len(frac))
+    dist[ids, ids, ZERO_SHIFT] = np.inf
+    vectors, distances = [], []
+    for i in range(len(frac)):
+        d = dist[i].reshape(-1)
+        v = cart[i].reshape(-1, 3)
+        mask = np.isfinite(d) & (d > 1e-6)
+        order = np.argsort(d[mask])
+        distances.append(d[mask][order])
+        vectors.append(v[mask][order])
+    return distances, vectors
+
+
+def periodic_cross_vectors(center_frac, neighbor_frac, cell):
+    center_frac = np.asarray(center_frac, dtype=float)
+    neighbor_frac = np.asarray(neighbor_frac, dtype=float)
+    delta = (
+        neighbor_frac[None, :, None, :]
+        - center_frac[:, None, None, :]
+        + SHIFTS[None, None, :, :]
+    )
+    cart = np.einsum("...i,ij->...j", delta, cell)
+    dist = np.linalg.norm(cart, axis=-1)
+    image = np.argmin(dist, axis=-1)
+    rows = np.arange(len(center_frac))[:, None]
+    cols = np.arange(len(neighbor_frac))[None, :]
+    return dist[rows, cols, image], cart[rows, cols, image]
+
+
+def _soft_histogram(values, weights, bins):
+    centers = 0.5 * (bins[:-1] + bins[1:])
+    sigma = max(float(np.diff(bins).mean()) * 0.45, 0.08)
+    values = np.asarray(values, dtype=float).reshape(-1)
+    weights = np.asarray(weights, dtype=float).reshape(-1)
+    if values.size == 0 or weights.sum() <= 1e-12:
+        return np.zeros(len(centers), dtype=float)
+    hist = (
+        weights[:, None]
+        * np.exp(-0.5 * ((values[:, None] - centers[None, :]) / sigma) ** 2)
+    ).sum(0)
+    return hist / max(hist.sum(), 1e-12)
+
+
+def soft_angle_hist(distances, vectors, cutoff, width, bins=ANGLE_BINS):
+    centers = 0.5 * (bins[:-1] + bins[1:])
+    sigma = max(float(np.diff(bins).mean()) * 0.45, 2.0)
+    histogram = np.zeros(len(centers), dtype=float)
+    for d, v in zip(distances, vectors):
+        weights = _stable_logistic_switch(d, cutoff, width)
+        keep = np.flatnonzero(weights > 0.05)
+        for ii in range(len(keep)):
+            i = keep[ii]
+            ni = np.linalg.norm(v[i])
+            for jj in range(ii + 1, len(keep)):
+                j = keep[jj]
+                nj = np.linalg.norm(v[j])
+                if ni <= 1e-10 or nj <= 1e-10:
+                    continue
+                angle = np.degrees(
+                    np.arccos(np.clip(np.dot(v[i], v[j]) / (ni * nj), -1, 1))
+                )
+                histogram += (
+                    weights[i]
+                    * weights[j]
+                    * np.exp(-0.5 * ((centers - angle) / sigma) ** 2)
+                )
+    return histogram / max(histogram.sum(), 1e-12)
+
+
+def framework_descriptor(frac, cell, chemistry_cutoff=CHEMISTRY_CUTOFF):
+    distances, vectors = periodic_neighbor_vectors(frac, cell)
+    cutoff = float(chemistry_cutoff)
+    shells = [d[d <= cutoff] for d in distances]
+    shell_values = np.concatenate(shells) if shells else np.asarray([], dtype=float)
+    if shell_values.size == 0:
+        raise ValueError("No Ti neighbours inside the chemistry cutoff")
+    cn_values = np.asarray([np.count_nonzero(d <= cutoff) for d in distances], dtype=float)
+    nn_mean = float(np.mean(shell_values))
+    nn_width = max(float(np.std(shell_values)), 0.03)
+    angle = soft_angle_hist(distances, vectors, cutoff, max(nn_width, 0.08))
+    nearest = np.asarray([d[0] for d in distances], dtype=float)
+    volume = abs(float(np.linalg.det(cell)))
+    return {
+        "ti_ti_cn": float(np.mean(cn_values)),
+        "ti_ti_mean": nn_mean,
+        "ti_ti_width": nn_width,
+        "minimum_ti_ti_distance": float(np.min(nearest)),
+        "volume_per_ti": volume / len(frac),
+        "ti_ti_angle_profile": angle,
+    }
+
+
+def tio2_environment_descriptor(ti_frac, o_frac, cell, cutoff=TIO_CUTOFF, smooth_width=None):
+    if len(ti_frac) < 1 or len(o_frac) < 1:
+        raise ValueError("Ti/O framework is empty")
+    dist, vec = periodic_cross_vectors(ti_frac, o_frac, cell)
+    hard = dist <= float(cutoff)
+    ti_cn = hard.sum(1).astype(float)
+    o_cn = hard.sum(0).astype(float)
+    bond = dist[hard]
+    hard_bond_shell_valid = bool(bond.size > 0)
+    if hard_bond_shell_valid:
+        hard_ti_o_mean = float(np.mean(bond))
+        hard_ti_o_width = max(float(np.std(bond)), 0.03)
+        inferred_smooth_width = max(hard_ti_o_width, 0.08)
+    else:
+        hard_ti_o_mean = float("nan")
+        hard_ti_o_width = float("nan")
+        inferred_smooth_width = max(float(np.min(dist)) * 0.10, 0.08)
+    effective_smooth_width = (
+        inferred_smooth_width if smooth_width is None else max(float(smooth_width), 0.03)
+    )
+    smooth = _stable_logistic_switch(dist, cutoff, effective_smooth_width)
+    smooth_denom = max(float(smooth.sum()), 1e-12)
+    proj_ti_cn = smooth.sum(1)
+    proj_o_cn = smooth.sum(0)
+    proj_mean = float((smooth * dist).sum() / smooth_denom)
+    proj_var = float(
+        (smooth * (dist - proj_mean) ** 2).sum() / smooth_denom
+    )
+    angle_values, angle_weights = [], []
+    oo_values, oo_weights = [], []
+    for i in range(len(ti_frac)):
+        ids = np.flatnonzero(smooth[i] > 0.05)
+        for a in range(len(ids)):
+            j = ids[a]
+            nj = np.linalg.norm(vec[i, j])
+            for b in range(a + 1, len(ids)):
+                k = ids[b]
+                nk = np.linalg.norm(vec[i, k])
+                if min(nj, nk) <= 1e-10:
+                    continue
+                w = smooth[i, j] * smooth[i, k]
+                angle = np.degrees(
+                    np.arccos(np.clip(np.dot(vec[i, j], vec[i, k]) / (nj * nk), -1, 1))
+                )
+                angle_values.append(angle)
+                angle_weights.append(w)
+                oo_values.append(np.linalg.norm(vec[i, j] - vec[i, k]))
+                oo_weights.append(w)
+    angle_profile = _soft_histogram(angle_values, angle_weights, ANGLE_BINS)
+    oo_profile = _soft_histogram(oo_values, oo_weights, OO_BINS)
+    oo_distances, _ = periodic_neighbor_vectors(o_frac, cell)
+    min_oo = min(float(d[0]) for d in oo_distances)
+    ti_distances, _ = periodic_neighbor_vectors(ti_frac, cell)
+    min_titi = min(float(d[0]) for d in ti_distances)
+    return {
+        "ti_o_cn": float(np.mean(ti_cn)),
+        "ti_o_cn_std": float(np.std(ti_cn)),
+        "o_ti_cn": float(np.mean(o_cn)),
+        "o_ti_cn_std": float(np.std(o_cn)),
+        "ti_o_mean": hard_ti_o_mean,
+        "ti_o_width": hard_ti_o_width,
+        "hard_ti_o_shell_valid": hard_bond_shell_valid,
+        "proj_ti_o_cn": float(np.mean(proj_ti_cn)),
+        "proj_ti_o_cn_std": float(np.std(proj_ti_cn)),
+        "proj_o_ti_cn": float(np.mean(proj_o_cn)),
+        "proj_o_ti_cn_std": float(np.std(proj_o_cn)),
+        "proj_ti_o_mean": proj_mean,
+        "proj_ti_o_width": float(math.sqrt(max(proj_var, 1e-12))),
+        "projection_smooth_width": float(effective_smooth_width),
+        "minimum_ti_ti_distance": min_titi,
+        "minimum_ti_o_distance": float(np.min(dist)),
+        "minimum_o_o_distance": min_oo,
+        "angle_profile": angle_profile,
+        "shell_o_o_profile": oo_profile,
+    }
+
+
+def split_structure(atoms: Atoms):
+    frac = np.asarray(atoms.get_scaled_positions(wrap=True), dtype=float)
+    symbols = np.asarray(atoms.get_chemical_symbols(), dtype=object)
+    ti_frac = frac[symbols == "Ti"]
+    o_frac = frac[symbols == "O"]
+    cell = np.asarray(atoms.cell.array, dtype=float)
+    if len(ti_frac) < 1 or len(o_frac) != 2 * len(ti_frac):
+        raise ValueError(f"structure is not TiO2: Ti={len(ti_frac)}, O={len(o_frac)}")
+    return ti_frac, o_frac, cell
+
+
+def descriptor_from_atoms(atoms: Atoms, cutoff: float, smooth_width: float | None = None):
+    ti_frac, o_frac, cell = split_structure(atoms)
+    framework = framework_descriptor(ti_frac, cell)
+    chemistry = tio2_environment_descriptor(
+        ti_frac, o_frac, cell, cutoff=cutoff, smooth_width=smooth_width
+    )
+    return {**framework, **chemistry}
+
+
+def _jensen_shannon(p, q):
+    p = np.asarray(p, dtype=float)
+    q = np.asarray(q, dtype=float)
+    p = np.clip(p, 0.0, None)
+    q = np.clip(q, 0.0, None)
+    ps, qs = float(p.sum()), float(q.sum())
+    if ps <= 1e-15 and qs <= 1e-15:
+        return 0.0
+    if ps <= 1e-15 or qs <= 1e-15:
+        return math.log(2.0)
+    p, q = p / ps, q / qs
+    m = 0.5 * (p + q)
+    def kl(a, b):
+        mask = a > 0
+        return float(np.sum(a[mask] * np.log(a[mask] / b[mask])))
+    return 0.5 * kl(p, m) + 0.5 * kl(q, m)
+
+
+# -----------------------------------------------------------------------------
+# Single-reference SO3 diagnostic and native LEGO optimization
+# -----------------------------------------------------------------------------
+
+_REFERENCE_SO3_EVALUATOR = None
+
+
+def make_reference_so3_evaluator(reference_tio2: Path, rcut: float):
+    evaluator = builder.__new__(builder)
+    evaluator.elements = ["Ti", "O"]
+    evaluator.dim = 3
+    evaluator.rank = 0
+    evaluator.verbose = False
+    evaluator.criteria = {}
+    evaluator.calculator = None
+    evaluator.ref_environments = None
+    evaluator.reference_environment_bank = None
+    evaluator.use_target_coordination = False
+    evaluator.last_optimization_results = []
+    evaluator.set_descriptor_calculator(mykwargs={"rcut": float(rcut)})
+    evaluator.set_reference_enviroments(str(reference_tio2))
+    return evaluator
+
+
+def _init_reference_so3_worker(reference_tio2: str, rcut: float):
+    global _REFERENCE_SO3_EVALUATOR
+    set_worker_thread_limits()
+    _REFERENCE_SO3_EVALUATOR = make_reference_so3_evaluator(
+        Path(reference_tio2), float(rcut)
+    )
+
+
+def _reference_so3_diagnostic_worker(payload):
+    source_row, stage, xtal = payload
+    try:
+        value = float(_REFERENCE_SO3_EVALUATOR.get_similarity(xtal))
+        if not math.isfinite(value):
+            raise ValueError("non-finite single-reference SO3 energy")
+        return {
+            "source_row": int(source_row),
+            "stage": str(stage),
+            "so3_reference_energy": value,
+            "worker_pid": int(os.getpid()),
+            "error": None,
+        }
+    except Exception as exc:
+        return {
+            "source_row": int(source_row),
+            "stage": str(stage),
+            "so3_reference_energy": math.nan,
+            "worker_pid": int(os.getpid()),
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+
+def evaluate_reference_so3_stage(candidates, reference_tio2: Path, rcut: float, stage: str, ncpu: int):
+    tasks = [(int(source_row), str(stage), xtal) for source_row, xtal in candidates]
+    values = {}
+    rows = []
+    worker_tasks = Counter()
+    first_error_printed = False
+    progress_every = max(1, len(tasks) // 10) if tasks else 1
+    initargs = (str(reference_tio2), float(rcut))
+
+    if max(1, int(ncpu)) == 1:
+        _init_reference_so3_worker(*initargs)
+        iterator = map(_reference_so3_diagnostic_worker, tasks)
+        pool = None
+    else:
+        pool = Pool(
+            processes=max(1, int(ncpu)),
+            initializer=_init_reference_so3_worker,
+            initargs=initargs,
+        )
+        iterator = pool.imap_unordered(
+            _reference_so3_diagnostic_worker,
+            tasks,
+            chunksize=1,
+        )
+
+    try:
+        valid = 0
+        for done, row in enumerate(iterator, start=1):
+            rows.append(row)
+            worker_tasks[int(row["worker_pid"])] += 1
+            if row["error"] is None:
+                valid += 1
+                values[int(row["source_row"])] = float(row["so3_reference_energy"])
+            elif not first_error_printed:
+                print(
+                    f"SO3 diagnostic [{stage}] first failure: "
+                    f"source_row={row['source_row']}; {row['error']}",
+                    flush=True,
+                )
+                first_error_printed = True
+            if done % progress_every == 0 or done == len(tasks):
+                print(
+                    f"SO3 diagnostic [{stage}]: {done}/{len(tasks)}; "
+                    f"valid={valid}; failed={done-valid}",
+                    flush=True,
+                )
+    finally:
+        if pool is not None:
+            pool.close()
+            pool.join()
+
+    print(
+        f"SO3 diagnostic [{stage}] worker tasks={dict(sorted(worker_tasks.items()))}",
+        flush=True,
+    )
+    rows.sort(key=lambda row: int(row["source_row"]))
+    return values, rows
+
+
+_SITE_SO3_EVALUATOR = None
+_SITE_SO3_NM_STEPS = 50
+_SITE_SO3_LBFGS_STEPS = 150
+
+
+def _site_reference_matrix(evaluator, xtal: pyxtal) -> np.ndarray:
+    refs = np.asarray(evaluator.ref_environments, dtype=float)
+    if refs.ndim == 1:
+        refs = refs.reshape(1, -1)
+    if refs.shape[0] != len(evaluator.elements):
+        raise ValueError(
+            "Element-reference count does not match evaluator elements: "
+            f"{refs.shape[0]} versus {len(evaluator.elements)}"
+        )
+    by_element = {
+        str(element): refs[index]
+        for index, element in enumerate(evaluator.elements)
+    }
+    rows = []
+    for index, site in enumerate(xtal.atom_sites):
+        symbol = str(site.specie)
+        if symbol not in by_element:
+            raise ValueError(
+                f"No SO3 reference for independent site {index} species {symbol!r}"
+            )
+        rows.append(by_element[symbol])
+    if not rows:
+        raise ValueError("No independent sites available for SO3 projection")
+    return np.vstack(rows)
+
+
+def _init_site_so3_worker(reference_tio2: str, rcut: float, nm_steps: int, lbfgs_steps: int):
+    global _SITE_SO3_EVALUATOR, _SITE_SO3_NM_STEPS, _SITE_SO3_LBFGS_STEPS
+    set_worker_thread_limits()
+    _SITE_SO3_EVALUATOR = make_reference_so3_evaluator(
+        Path(reference_tio2), float(rcut)
+    )
+    _SITE_SO3_NM_STEPS = int(nm_steps)
+    _SITE_SO3_LBFGS_STEPS = int(lbfgs_steps)
+
+
+def _full_so3_worker(payload):
+    source_row, raw_xtal = payload
+    source_row = int(source_row)
+    try:
+        xtal = raw_xtal.copy()
+        xtal.tag = deepcopy(getattr(raw_xtal, "tag", {}) or {})
+        x0 = np.asarray(xtal.get_1d_rep_x(), dtype=float)
+        n_abc, n_ang = Lattice.get_dofs(xtal.lattice.ltype)
+        lattice_dof = int(n_abc + n_ang)
+        if lattice_dof > len(x0):
+            raise ValueError(
+                f"Lattice DOF {lattice_dof} exceeds 1D representation length {len(x0)}"
+            )
+        ref_matrix = _site_reference_matrix(_SITE_SO3_EVALUATOR, xtal)
+
+        # Match PyXtal LEGO's native local-optimization variable space:
+        # lattice lengths, lattice angles, then Wyckoff free coordinates.
+        bounds = (
+            [(1.5, 50.0)] * n_abc
+            + [(30.0, 150.0)] * n_ang
+            + [(0.0, 1.0)] * (len(x0) - lattice_dof)
+        )
+        if len(bounds) != len(x0):
+            raise ValueError(
+                f"SO3 bounds length {len(bounds)} != representation length {len(x0)}"
+            )
+
+        lower = np.asarray([b[0] for b in bounds], dtype=float)
+        upper = np.asarray([b[1] for b in bounds], dtype=float)
+        x_start = np.clip(x0, lower, upper)
+
+        def objective(x):
+            value = float(calculate_S(
+                np.asarray(x, dtype=float),
+                xtal,
+                ref_matrix,
+                _SITE_SO3_EVALUATOR.calculator,
+            ))
+            if not math.isfinite(value):
+                return 1.0e300
+            return value
+
+        sim0 = float(objective(x_start))
+        best_x = x_start.copy()
+        best_sim = sim0
+        evaluations = 1
+
+        x = x_start.copy()
+        for method, steps in (
+            ("Nelder-Mead", _SITE_SO3_NM_STEPS),
+            ("L-BFGS-B", _SITE_SO3_LBFGS_STEPS),
+        ):
+            if steps <= 0:
+                continue
+            res = minimize(
+                objective,
+                x,
+                method=method,
+                bounds=bounds,
+                options={"maxiter": int(steps)},
+            )
+            evaluations += int(getattr(res, "nfev", 0) or 0)
+            x = np.clip(np.asarray(res.x, dtype=float), lower, upper)
+            stage_sim = float(objective(x))
+            evaluations += 1
+            if math.isfinite(stage_sim) and stage_sim < best_sim:
+                best_sim = stage_sim
+                best_x = x.copy()
+
+        improved = bool(best_sim < sim0 - 1.0e-12)
+        if improved:
+            final_xtal = raw_xtal.copy()
+            final_xtal.update_from_1d_rep(best_x)
+            final_xtal.tag = deepcopy(getattr(raw_xtal, "tag", {}) or {})
+        else:
+            final_xtal = raw_xtal
+            best_sim = sim0
+
+        return {
+            "source_row": source_row,
+            "success": True,
+            "initial_so3_reference_energy": sim0,
+            "final_so3_reference_energy": float(best_sim),
+            "improved": improved,
+            "raw_fallback_used": bool(not improved),
+            "lattice_dof": lattice_dof,
+            "site_coordinate_dof": int(len(x0) - lattice_dof),
+            "objective_evaluations": int(evaluations),
+            "worker_pid": int(os.getpid()),
+            "xtal": final_xtal,
+            "error": None,
+        }
+    except Exception as exc:
+        return {
+            "source_row": source_row,
+            "success": False,
+            "initial_so3_reference_energy": math.nan,
+            "final_so3_reference_energy": math.nan,
+            "improved": False,
+            "raw_fallback_used": True,
+            "lattice_dof": math.nan,
+            "site_coordinate_dof": math.nan,
+            "objective_evaluations": 0,
+            "worker_pid": int(os.getpid()),
+            "xtal": raw_xtal,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+
+def optimize_single_reference_so3(raw_candidates, reference_tio2: Path, rcut: float, ncpu: int, nm_steps: int, lbfgs_steps: int):
+    """Optimize lattice and Wyckoff free coordinates against rutile SO3.
+
+    The full native PyXtal 1D representation is optimized with the same local
+    variable bounds used by PyXtal LEGO: lattice lengths 1.5--50 A, lattice
+    angles 30--150 degrees, and Wyckoff free coordinates 0--1. Reference rows
+    are assigned by independent-site species: Ti->rutile Ti and O->rutile O.
+    """
+    tasks = [(int(source_row), xtal) for source_row, xtal in raw_candidates]
+    initargs = (str(reference_tio2), float(rcut), int(nm_steps), int(lbfgs_steps))
+    if max(1, int(ncpu)) == 1:
+        _init_site_so3_worker(*initargs)
+        iterator = map(_full_so3_worker, tasks)
+        pool = None
+    else:
+        pool = Pool(
+            processes=max(1, int(ncpu)),
+            initializer=_init_site_so3_worker,
+            initargs=initargs,
+        )
+        iterator = pool.imap_unordered(_full_so3_worker, tasks, chunksize=1)
+
+    rows = []
+    projected_by_source = {}
+    worker_tasks = Counter()
+    first_error_printed = False
+    success_count = 0
+    progress_every = max(1, len(tasks) // 10) if tasks else 1
+    try:
+        for done, result in enumerate(iterator, start=1):
+            worker_tasks[int(result["worker_pid"])] += 1
+            source_row = int(result["source_row"])
+            projected_by_source[source_row] = result.pop("xtal")
+            row = {k: v for k, v in result.items() if k != "worker_pid"}
+            rows.append(row)
+            if bool(row["success"]):
+                success_count += 1
+            elif not first_error_printed:
+                print(
+                    f"Full-representation SO3 first failure: source_row={source_row}; {row['error']}",
+                    flush=True,
+                )
+                first_error_printed = True
+            if done % progress_every == 0 or done == len(tasks):
+                print(
+                    f"Full-representation SO3 refinement: {done}/{len(tasks)}; "
+                    f"success={success_count}; failed={done-success_count}",
+                    flush=True,
+                )
+    finally:
+        if pool is not None:
+            pool.close()
+            pool.join()
+
+    projected = [
+        (int(source_row), projected_by_source[int(source_row)])
+        for source_row, _ in raw_candidates
+    ]
+    rows.sort(key=lambda row: int(row["source_row"]))
+    print(
+        f"Full-representation SO3 worker tasks={dict(sorted(worker_tasks.items()))}",
+        flush=True,
+    )
+    return projected, rows
+
+
+
+def stage_metric_record(
+    source_row: int,
+    candidate_meta: dict,
+    stage: str,
+    atoms: Atoms,
+    cutoff: float,
+):
+    record = {
+        "source_row": int(source_row),
+        "candidate_id": candidate_meta.get("candidate_id"),
+        "final_rank": candidate_meta.get("final_rank"),
+        "ranking_score": candidate_meta.get("ranking_score"),
+        "stage": stage,
+        "spg_detected": None,
+        "volume_A3": float(abs(np.linalg.det(atoms.cell.array))),
+        "chemistry_descriptor_evaluable": False,
+        "chemistry_descriptor_reason": None,
+    }
+    try:
+        desc = descriptor_from_atoms(atoms, cutoff)
+        record["chemistry_descriptor_evaluable"] = bool(
+            desc.get("hard_ti_o_shell_valid", True)
+        )
+        if not record["chemistry_descriptor_evaluable"]:
+            record["chemistry_descriptor_reason"] = (
+                f"No Ti-O neighbours within {float(cutoff):.3f} A"
+            )
+        record.update(
+            {
+                k: (bool(v) if isinstance(v, (bool, np.bool_)) else float(v))
+                for k, v in desc.items()
+                if k not in {"angle_profile", "shell_o_o_profile", "ti_ti_angle_profile"}
             }
-            records.append(record)
-            if accepted:
-                kvp = dict(row.key_value_pairs)
-                kvp["so3_db_row"] = int(row.id)
-                # Direct element-specific SO3 uses no atom-site target metadata.
-                # Removing it prevents irrelevant Wyckoff-label remapping errors
-                # when a relaxed orbit is equivalently relabelled (e.g. 48e->48g).
-                for key in (
-                    "site_properties_json",
-                    "cn_labels_json",
-                    "cn_wp_labels",
-                ):
-                    kvp.pop(key, None)
-                dst.write(row.toatoms(), key_value_pairs=kvp, data=row.data)
-                selected += 1
-    return selected, records
+        )
+    except Exception as exc:
+        desc = None
+        record["chemistry_descriptor_reason"] = f"{type(exc).__name__}: {exc}"
+    try:
+        tmp = pyxtal()
+        tmp.from_seed(atoms)
+        record["spg_detected"] = int(tmp.group.number)
+    except Exception:
+        pass
+    if desc is not None and candidate_meta:
+        angle_cols = [f"target_angle_bin_{i}" for i in range(len(ANGLE_BINS) - 1)]
+        oo_cols = [f"target_shell_o_o_bin_{i}" for i in range(len(OO_BINS) - 1)]
+        if all(c in candidate_meta and pd.notna(candidate_meta[c]) for c in angle_cols):
+            target = np.asarray([candidate_meta[c] for c in angle_cols], dtype=float)
+            record["angle_jsd_to_generation_target"] = _jensen_shannon(target, desc["angle_profile"])
+        if all(c in candidate_meta and pd.notna(candidate_meta[c]) for c in oo_cols):
+            target = np.asarray([candidate_meta[c] for c in oo_cols], dtype=float)
+            record["shell_o_o_jsd_to_generation_target"] = _jensen_shannon(target, desc["shell_o_o_profile"])
+    return record
 
 
-
+def _strip_reason_columns(frame: pd.DataFrame) -> pd.DataFrame:
+    return frame.drop(
+        columns=[c for c in frame.columns if "reason" in str(c).lower()],
+        errors="ignore",
+    )
 _MATCH_STRUCTURES = None
 _MATCHER = None
 
@@ -476,13 +971,18 @@ _MATCHER = None
 def _init_structure_match_worker(structures, matcher_kwargs):
     global _MATCH_STRUCTURES, _MATCHER
     _MATCH_STRUCTURES = structures
+    kwargs = dict(matcher_kwargs)
+    primitive_cell = bool(kwargs.pop("primitive_cell", True))
+    scale = bool(kwargs.pop("scale", True))
+    attempt_supercell = bool(kwargs.pop("attempt_supercell", True))
+    allow_subset = bool(kwargs.pop("allow_subset", False))
     _MATCHER = StructureMatcher(
-        primitive_cell=True,
-        scale=True,
-        attempt_supercell=True,
-        allow_subset=False,
+        primitive_cell=primitive_cell,
+        scale=scale,
+        attempt_supercell=attempt_supercell,
+        allow_subset=allow_subset,
         comparator=ElementComparator(),
-        **matcher_kwargs,
+        **kwargs,
     )
 
 
@@ -522,237 +1022,385 @@ class _UnionFind:
             self.rank[ra] += 1
 
 
-def _candidate_match_pairs(successful, structures, energy_window, volume_tol):
+def deduplicate_final_stage(
+    final_candidates,
+    candidate_summary: dict,
+    output_dir: Path,
+    ncpu: int,
+    ltol: float,
+    stol: float,
+    angle_tol: float,
+    volume_tol: float,
+    chunksize: int,
+):
+    """Deduplicate the final raw/SO3 structures without an energy oracle.
+
+    SO3 similarity to rutile is deliberately not used for representative
+    selection or ranking. Within each StructureMatcher component, retain the
+    candidate with the earliest v33 final_rank, then source_row. The final table
+    preserves that v33 ordering after duplicate components are collapsed.
+    """
+    prepared = []
+    failures = []
+    adaptor = AseAtomsAdaptor()
+    for source_row, xtal in final_candidates:
+        source_row = int(source_row)
+        try:
+            atoms = xtal.to_ase(resort=False)
+            structure = adaptor.get_structure(atoms)
+            meta = candidate_summary[source_row]
+            prepared.append(
+                (
+                    {
+                        "source_row": source_row,
+                        "v33_final_rank": int(meta["final_rank"]),
+                        "candidate_id": meta.get("candidate_id"),
+                        "final_stage": (
+                            "so3"
+                            if bool(meta.get("so3_refinement_applied", False))
+                            else "raw"
+                        ),
+                        "so3_raw_energy": meta.get("so3_raw_energy"),
+                        "so3_final_energy": meta.get("so3_projected_energy"),
+                        "delta_so3_final_minus_raw": meta.get(
+                            "delta_so3_projected_minus_raw"
+                        ),
+                    },
+                    atoms,
+                    structure,
+                )
+            )
+        except Exception as exc:
+            failures.append(
+                {
+                    "source_row": source_row,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+
+    pd.DataFrame(failures).to_csv(
+        output_dir / "final_stage_structure_failures.csv", index=False
+    )
+    if not prepared:
+        empty = pd.DataFrame()
+        empty.to_csv(output_dir / "ranked_candidates.csv", index=False)
+        return empty, empty, empty
+
+    structures = [item[2] for item in prepared]
     pairs = []
-    for i in range(len(successful)):
-        rec_i = successful[i][0]
-        s_i = structures[i]
-        formula_i = s_i.composition.reduced_formula
+    for i, (_, _, s_i) in enumerate(prepared):
         vpa_i = s_i.volume / max(s_i.num_sites, 1)
-        for j in range(i + 1, len(successful)):
-            rec_j = successful[j][0]
+        formula_i = s_i.composition.reduced_formula
+        for j in range(i + 1, len(prepared)):
             s_j = structures[j]
             if formula_i != s_j.composition.reduced_formula:
                 continue
-            if math.isfinite(energy_window):
-                if abs(rec_i["ff_energy_eV_per_atom"] - rec_j["ff_energy_eV_per_atom"]) > energy_window:
-                    continue
             if math.isfinite(volume_tol):
                 vpa_j = s_j.volume / max(s_j.num_sites, 1)
                 rel = abs(vpa_i - vpa_j) / max(vpa_i, vpa_j, 1e-12)
                 if rel > volume_tol:
                     continue
             pairs.append((i, j))
-    return pairs
 
+    print(
+        f"Final-stage StructureMatcher: {len(prepared)} structures; "
+        f"{len(pairs)} candidate pairs; "
+        f"{min(ncpu, max(len(pairs), 1))} worker(s)",
+        flush=True,
+    )
+    uf = _UnionFind(len(prepared))
+    match_rows = []
+    matcher_kwargs = {"ltol": ltol, "stol": stol, "angle_tol": angle_tol}
+    if pairs:
+        worker_count = min(ncpu, len(pairs))
+        progress_every = max(1, len(pairs) // 10)
+        if worker_count == 1:
+            _init_structure_match_worker(structures, matcher_kwargs)
+            iterator = map(_match_structure_pair, pairs)
+            pool = None
+        else:
+            ctx = mp.get_context("spawn")
+            pool = ctx.Pool(
+                processes=worker_count,
+                initializer=_init_structure_match_worker,
+                initargs=(structures, matcher_kwargs),
+            )
+            iterator = pool.imap_unordered(
+                _match_structure_pair, pairs, chunksize=max(1, chunksize)
+            )
+        try:
+            for done, (i, j, matched, rms, max_dist, error) in enumerate(
+                iterator, start=1
+            ):
+                if matched:
+                    uf.union(i, j)
+                match_rows.append(
+                    {
+                        "source_row_a": prepared[i][0]["source_row"],
+                        "source_row_b": prepared[j][0]["source_row"],
+                        "matched": matched,
+                        "normalized_rms_distance": rms,
+                        "normalized_max_distance": max_dist,
+                        "error": error,
+                    }
+                )
+                if done % progress_every == 0 or done == len(pairs):
+                    print(
+                        f"Final-stage structure matching: {done}/{len(pairs)}",
+                        flush=True,
+                    )
+        finally:
+            if pool is not None:
+                pool.close()
+                pool.join()
 
-def write_ranked_outputs(
-    gulp_db_path: Path,
-    output_dir: Path,
-    ncpu: int,
-    matcher_kwargs: dict,
-    energy_window: float,
-    volume_tol: float,
-    chunksize: int,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Rank all GULP minima and deduplicate by direct periodic-structure matching.
+    components = defaultdict(list)
+    for i in range(len(prepared)):
+        components[uf.find(i)].append(i)
 
-    Energy and volume are used only as cheap pair prefilters. Duplicate identity
-    is decided exclusively by pymatgen StructureMatcher.fit(). Pair comparisons
-    are independent and therefore distributed over CPU workers; matched pairs
-    are merged into connected components with a deterministic union-find pass.
-    """
     candidates_dir = output_dir / "candidates"
     if candidates_dir.exists():
         shutil.rmtree(candidates_dir)
     candidates_dir.mkdir(parents=True)
 
-    successful = []
-    failed = []
-    parse_failed = []
-    with connect(gulp_db_path) as db:
-        for row in db.select():
-            base = {
-                "gulp_db_row": int(row.id),
-                "so3_db_row": int(row.so3_db_row) if hasattr(row, "so3_db_row") else None,
-                "source_row": int(row.source_row) if hasattr(row, "source_row") else None,
-                "representative_source_row": int(row.representative_source_row) if hasattr(row, "representative_source_row") else None,
-                "generation_count": int(row.generation_count) if hasattr(row, "generation_count") else 1,
-                "source_rows_json": row.source_rows_json if hasattr(row, "source_rows_json") else "[]",
-                "space_group": int(row.space_group_number),
-                "wyckoff_pattern": str(row.wps) if hasattr(row, "wps") else "",
-                "pearson_symbol": row.pearson_symbol,
-                "num_atoms": int(row.natoms),
-                "initial_so3_energy": float(row.similarity0),
-                "final_so3_energy": float(row.similarity),
-            }
-            if hasattr(row, "ff_energy") and row.ff_energy is not None and hasattr(row, "ff_relaxed"):
-                cif_text = str(row.ff_relaxed)
-                try:
-                    structure = Structure.from_str(cif_text, fmt="cif")
-                except Exception as exc:
-                    parse_failed.append({
-                        **base,
-                        "failure_reason": f"Cannot parse ff_relaxed CIF: {type(exc).__name__}: {exc}",
-                    })
-                    continue
-                base["ff_energy_eV_per_atom"] = float(row.ff_energy)
-                base["relaxed_formula"] = structure.composition.reduced_formula
-                base["relaxed_num_sites"] = int(structure.num_sites)
-                base["relaxed_volume_per_atom"] = float(structure.volume / structure.num_sites)
-                successful.append((base, cif_text, structure))
-            else:
-                failed.append({**base, "failure_reason": "GULP result missing"})
-
-    successful.sort(key=lambda item: item[0]["ff_energy_eV_per_atom"])
-    all_ranked_df = pd.DataFrame([
-        {"all_rank": rank, **record}
-        for rank, (record, _cif, _structure) in enumerate(successful, start=1)
-    ])
-    all_ranked_df.to_csv(output_dir / "ranked_all_candidates.csv", index=False)
-
-    structures = [item[2] for item in successful]
-    pairs = _candidate_match_pairs(successful, structures, energy_window, volume_tol)
-    print(
-        f"Post-GULP StructureMatcher: {len(successful)} structures; "
-        f"{len(pairs)} candidate pairs; {min(ncpu, max(len(pairs), 1))} worker(s)"
-    )
-
-    uf = _UnionFind(len(successful))
-    match_rows = []
-    if pairs:
-        worker_count = min(ncpu, len(pairs))
-        if worker_count == 1:
-            _init_structure_match_worker(structures, matcher_kwargs)
-            results = map(_match_structure_pair, pairs)
-            for i, j, matched, rms, max_dist, error in tqdm(
-                results, total=len(pairs), desc="Structure matching"
-            ):
-                if matched:
-                    uf.union(i, j)
-                match_rows.append({
-                    "gulp_db_row_a": successful[i][0]["gulp_db_row"],
-                    "gulp_db_row_b": successful[j][0]["gulp_db_row"],
-                    "matched": matched,
-                    "normalized_rms_distance": rms,
-                    "normalized_max_distance": max_dist,
-                    "error": error,
-                })
-        else:
-            from multiprocessing import Pool
-            with Pool(
-                processes=worker_count,
-                initializer=_init_structure_match_worker,
-                initargs=(structures, matcher_kwargs),
-            ) as pool:
-                results = pool.imap_unordered(
-                    _match_structure_pair, pairs, chunksize=max(1, chunksize)
-                )
-                for i, j, matched, rms, max_dist, error in tqdm(
-                    results, total=len(pairs), desc="Structure matching"
-                ):
-                    if matched:
-                        uf.union(i, j)
-                    match_rows.append({
-                        "gulp_db_row_a": successful[i][0]["gulp_db_row"],
-                        "gulp_db_row_b": successful[j][0]["gulp_db_row"],
-                        "matched": matched,
-                        "normalized_rms_distance": rms,
-                        "normalized_max_distance": max_dist,
-                        "error": error,
-                    })
-
-    components = defaultdict(list)
-    for i in range(len(successful)):
-        components[uf.find(i)].append(i)
-
     retained = []
-    duplicate_rows = []
-    for component_id, member_indices in enumerate(components.values(), start=1):
-        member_indices.sort(key=lambda idx: (
-            successful[idx][0]["ff_energy_eV_per_atom"],
-            successful[idx][0]["final_so3_energy"],
-            successful[idx][0]["representative_source_row"],
-        ))
-        rep_idx = member_indices[0]
-        representative, cif_text, _ = successful[rep_idx]
-        member_gulp_rows = [successful[idx][0]["gulp_db_row"] for idx in member_indices]
-        member_source_rows = [successful[idx][0]["representative_source_row"] for idx in member_indices]
-        retained.append(({
-            **representative,
-            "structure_match_component": component_id,
-            "post_gulp_multiplicity": len(member_indices),
-            "post_gulp_gulp_rows_json": json.dumps(member_gulp_rows, separators=(",", ":")),
-            "post_gulp_source_rows_json": json.dumps(member_source_rows, separators=(",", ":")),
-        }, cif_text))
-        for idx in member_indices[1:]:
-            duplicate = successful[idx][0]
-            duplicate_rows.append({
-                "structure_match_component": component_id,
-                "representative_source_row": duplicate["representative_source_row"],
-                "retained_source_row": representative["representative_source_row"],
-                "gulp_db_row": duplicate["gulp_db_row"],
-                "retained_gulp_db_row": representative["gulp_db_row"],
-                "ff_energy_eV_per_atom": duplicate["ff_energy_eV_per_atom"],
-                "retained_ff_energy_eV_per_atom": representative["ff_energy_eV_per_atom"],
-                "final_so3_energy": duplicate["final_so3_energy"],
-                "space_group": duplicate["space_group"],
-                "wyckoff_pattern": duplicate["wyckoff_pattern"],
-                "duplicate_decision": "pymatgen StructureMatcher connected component",
-            })
+    duplicates = []
+    for component_id, members in enumerate(components.values(), start=1):
+        members.sort(
+            key=lambda idx: (
+                prepared[idx][0]["v33_final_rank"],
+                prepared[idx][0]["source_row"],
+            )
+        )
+        rep = members[0]
+        record, atoms, structure = prepared[rep]
+        retained.append(
+            (
+                {
+                    **record,
+                    "structure_match_component": component_id,
+                    "post_refinement_multiplicity": len(members),
+                },
+                structure,
+            )
+        )
+        for idx in members[1:]:
+            duplicate = prepared[idx][0]
+            duplicates.append(
+                {
+                    "structure_match_component": component_id,
+                    "source_row": duplicate["source_row"],
+                    "v33_final_rank": duplicate["v33_final_rank"],
+                    "retained_source_row": record["source_row"],
+                    "retained_v33_final_rank": record["v33_final_rank"],
+                }
+            )
 
-    retained.sort(key=lambda item: item[0]["ff_energy_eV_per_atom"])
+    retained.sort(
+        key=lambda item: (
+            item[0]["v33_final_rank"],
+            item[0]["source_row"],
+        )
+    )
     ranked = []
-    for rank, (record, cif_text) in enumerate(retained, start=1):
-        cif_name = f"rank_{rank:04d}_row_{record['representative_source_row']}.cif"
-        cif_path = candidates_dir / cif_name
-        cif_path.write_text(cif_text)
-        ranked.append({"rank": rank, **record, "cif_path": str(cif_path)})
+    for rank, (record, structure) in enumerate(retained, start=1):
+        cif_path = candidates_dir / (
+            f"rank_{rank:04d}_row_{record['source_row']}.cif"
+        )
+        structure.to(filename=str(cif_path), fmt="cif")
+        ranked.append(
+            {
+                "rank": rank,
+                **record,
+                "cif_path": str(cif_path),
+            }
+        )
 
-    ranked_df = pd.DataFrame(ranked)
-    duplicate_df = pd.DataFrame(duplicate_rows)
     match_df = pd.DataFrame(match_rows)
-    failed_df = pd.DataFrame(failed + parse_failed)
-    ranked_df.to_csv(output_dir / "ranked_candidates.csv", index=False)
-    duplicate_df.to_csv(output_dir / "post_gulp_duplicates.csv", index=False)
+    duplicate_df = pd.DataFrame(duplicates)
+    ranked_df = pd.DataFrame(ranked)
     match_df.to_csv(output_dir / "structure_match_pairs.csv", index=False)
-    failed_df.to_csv(output_dir / "gulp_failures.csv", index=False)
-    return ranked_df, all_ranked_df, duplicate_df, match_df, failed_df
+    duplicate_df.to_csv(
+        output_dir / "post_refinement_duplicates.csv", index=False
+    )
+    ranked_df.to_csv(output_dir / "ranked_candidates.csv", index=False)
+    return ranked_df, duplicate_df, match_df
 
-def compare_ranked_to_training_set(
+
+
+def export_unique_standard_vasp(
+    ranked_df: pd.DataFrame,
+    final_candidates,
+    output_dir: Path,
+    symprec: float = 0.1,
+    angle_tolerance: float = 5.0,
+):
+    """Export all final-stage StructureMatcher-unique candidates as
+    symmetrized standard conventional VASP structures.
+
+    This export deliberately ignores training-set overlap. Structures are taken
+    from the in-memory final raw/SO3 PyXtal objects, not reparsed from CIF.
+    """
+    export_dir = output_dir / "unique_standard_vasp"
+    if export_dir.exists():
+        shutil.rmtree(export_dir)
+    export_dir.mkdir(parents=True)
+
+    xtal_by_row = {int(source_row): xtal for source_row, xtal in final_candidates}
+    adaptor = AseAtomsAdaptor()
+    report_rows = []
+
+    for _, row in ranked_df.iterrows():
+        rank = int(row["rank"])
+        source_row = int(row["source_row"])
+        final_stage = str(row.get("final_stage", "unknown"))
+        output_path = export_dir / (
+            f"rank_{rank:04d}_row_{source_row:04d}_{final_stage}_std.vasp"
+        )
+        try:
+            xtal = xtal_by_row[source_row]
+            structure = adaptor.get_structure(xtal.to_ase(resort=False))
+            input_analyzer = SpacegroupAnalyzer(
+                structure, symprec=symprec, angle_tolerance=angle_tolerance
+            )
+            input_spg_number = int(input_analyzer.get_space_group_number())
+            input_spg_symbol = str(input_analyzer.get_space_group_symbol())
+
+            refined = input_analyzer.get_refined_structure()
+            refined_analyzer = SpacegroupAnalyzer(
+                refined, symprec=symprec, angle_tolerance=angle_tolerance
+            )
+            standard = refined_analyzer.get_conventional_standard_structure()
+            standard = standard.get_sorted_structure(
+                key=lambda site: (0 if site.specie.symbol == "Ti" else 1, site.specie.symbol)
+            )
+            standard_analyzer = SpacegroupAnalyzer(
+                standard, symprec=symprec, angle_tolerance=angle_tolerance
+            )
+            standard_spg_number = int(standard_analyzer.get_space_group_number())
+            standard_spg_symbol = str(standard_analyzer.get_space_group_symbol())
+
+            comment = (
+                f"TiO2 SG{standard_spg_number} {standard_spg_symbol} "
+                f"rank={rank} source_row={source_row} stage={final_stage}"
+            )
+            Poscar(standard, comment=comment).write_file(str(output_path))
+            report_rows.append(
+                {
+                    "rank": rank,
+                    "source_row": source_row,
+                    "final_stage": final_stage,
+                    "status": "ok",
+                    "output_vasp": str(output_path),
+                    "input_spg_number": input_spg_number,
+                    "input_spg_symbol": input_spg_symbol,
+                    "standard_spg_number": standard_spg_number,
+                    "standard_spg_symbol": standard_spg_symbol,
+                    "input_natoms": int(structure.num_sites),
+                    "standard_natoms": int(standard.num_sites),
+                    "a_A": float(standard.lattice.a),
+                    "b_A": float(standard.lattice.b),
+                    "c_A": float(standard.lattice.c),
+                    "alpha_deg": float(standard.lattice.alpha),
+                    "beta_deg": float(standard.lattice.beta),
+                    "gamma_deg": float(standard.lattice.gamma),
+                    "volume_A3": float(standard.volume),
+                    "error": None,
+                }
+            )
+        except Exception as exc:
+            report_rows.append(
+                {
+                    "rank": rank,
+                    "source_row": source_row,
+                    "final_stage": final_stage,
+                    "status": "failed",
+                    "output_vasp": str(output_path),
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+
+    report_df = pd.DataFrame(report_rows)
+    report_df.to_csv(output_dir / "unique_standard_vasp_report.csv", index=False)
+    ok = int((report_df.get("status") == "ok").sum()) if not report_df.empty else 0
+    failed = int(len(report_df) - ok)
+    print(
+        f"Unique standard VASP export: {ok}/{len(report_df)} written; failed={failed}; "
+        f"directory={export_dir}",
+        flush=True,
+    )
+    return report_df, export_dir
+
+def _structure_space_group_number(structure: Structure) -> int | None:
+    try:
+        xtal = pyxtal()
+        xtal.from_seed(AseAtomsAdaptor.get_atoms(structure))
+        if xtal is not None and xtal.valid:
+            return int(xtal.group.number)
+    except Exception:
+        pass
+    return None
+
+
+def compare_ranked_to_training_set_strict(
     ranked_df: pd.DataFrame,
     training_db_path: Path,
     output_dir: Path,
     ncpu: int,
-    matcher_kwargs: dict,
+    ltol: float,
+    stol: float,
+    angle_tol: float,
+    volume_tol: float,
     chunksize: int,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Annotate retained candidates that reproduce structures in the training DB.
+    """Conservatively identify final candidates that reproduce training structures.
 
-    The original LEGO-Xtal pipeline performed a source-database overlap check.
-    Here the same scientific check is applied directly to the final GULP-relaxed
-    candidates with pymatgen StructureMatcher. Comparisons are parallel and
-    matches are reported, not removed.
+    This matcher is intentionally stricter than final-stage candidate deduplication:
+    no uniform lattice scaling and no supercell search are allowed. Candidate and
+    training structures must also have the same detected space group, primitive
+    site count, reduced formula, and similar volume per atom before StructureMatcher
+    is invoked.
     """
-    empty_columns = [
-        "candidate_rank", "candidate_source_row", "candidate_gulp_db_row",
-        "training_db_row", "training_label", "normalized_rms_distance",
-        "normalized_max_distance", "error",
+    output_columns = [
+        "candidate_rank",
+        "candidate_source_row",
+        "training_db_row",
+        "training_label",
+        "candidate_space_group",
+        "training_space_group",
+        "candidate_primitive_sites",
+        "training_primitive_sites",
+        "candidate_volume_per_atom",
+        "training_volume_per_atom",
+        "relative_volume_per_atom_difference",
+        "normalized_rms_distance",
+        "normalized_max_distance",
+        "error",
     ]
     if ranked_df.empty:
-        match_df = pd.DataFrame(columns=empty_columns)
+        match_df = pd.DataFrame(columns=output_columns)
         match_df.to_csv(output_dir / "training_set_matches.csv", index=False)
         return ranked_df, match_df
 
     candidate_structures = []
-    valid_candidate_rows = []
+    candidate_meta = []
     for _, row in ranked_df.iterrows():
         try:
-            candidate_structures.append(Structure.from_file(str(row["cif_path"])))
-            valid_candidate_rows.append(row)
+            structure = Structure.from_file(str(row["cif_path"]))
+            primitive = structure.get_primitive_structure()
+            candidate_structures.append(structure)
+            candidate_meta.append(
+                {
+                    "rank": int(row["rank"]),
+                    "source_row": int(row["source_row"]),
+                    "space_group": _structure_space_group_number(structure),
+                    "primitive_sites": int(primitive.num_sites),
+                    "volume_per_atom": float(structure.volume / max(structure.num_sites, 1)),
+                }
+            )
         except Exception as exc:
             print(
-                f"Cannot parse ranked candidate {row.get('rank')}: "
+                f"Cannot parse ranked candidate {row.get('rank')} for training overlap: "
                 f"{type(exc).__name__}: {exc}"
             )
 
@@ -763,6 +1411,7 @@ def compare_ranked_to_training_set(
         for row in db.select():
             try:
                 structure = adaptor.get_structure(row.toatoms())
+                primitive = structure.get_primitive_structure()
             except Exception as exc:
                 print(
                     f"Cannot load training DB row {row.id}: "
@@ -776,38 +1425,73 @@ def compare_ranked_to_training_set(
                     if value is not None:
                         label = str(value)
                         break
+            spg = (
+                int(row.space_group_number)
+                if hasattr(row, "space_group_number")
+                else _structure_space_group_number(structure)
+            )
             training_structures.append(structure)
-            training_meta.append({
-                "training_db_row": int(row.id),
-                "training_label": label or f"row_{row.id}",
-            })
+            training_meta.append(
+                {
+                    "training_db_row": int(row.id),
+                    "training_label": label or f"row_{row.id}",
+                    "space_group": spg,
+                    "primitive_sites": int(primitive.num_sites),
+                    "volume_per_atom": float(structure.volume / max(structure.num_sites, 1)),
+                    "formula": structure.composition.reduced_formula,
+                }
+            )
 
     if not candidate_structures or not training_structures:
-        match_df = pd.DataFrame(columns=empty_columns)
-        match_df.to_csv(output_dir / "training_set_matches.csv", index=False)
         annotated = ranked_df.copy()
         annotated["in_training_set"] = False
         annotated["training_match_count"] = 0
         annotated["training_db_rows_json"] = "[]"
-        annotated["best_training_db_row"] = None
-        annotated["best_training_rms"] = None
-        annotated["best_training_max_dist"] = None
+        match_df = pd.DataFrame(columns=output_columns)
         annotated.to_csv(output_dir / "ranked_candidates.csv", index=False)
+        match_df.to_csv(output_dir / "training_set_matches.csv", index=False)
         return annotated, match_df
 
     combined = candidate_structures + training_structures
     offset = len(candidate_structures)
     pairs = []
-    for i, cand in enumerate(candidate_structures):
-        formula = cand.composition.reduced_formula
-        for j, train in enumerate(training_structures):
-            if formula == train.composition.reduced_formula:
-                pairs.append((i, offset + j))
+    pair_prefilter_meta = {}
+    for i, structure in enumerate(candidate_structures):
+        meta = candidate_meta[i]
+        formula = structure.composition.reduced_formula
+        for j, train_meta in enumerate(training_meta):
+            if formula != train_meta["formula"]:
+                continue
+            if meta["space_group"] is None or train_meta["space_group"] is None:
+                continue
+            if meta["space_group"] != train_meta["space_group"]:
+                continue
+            if meta["primitive_sites"] != train_meta["primitive_sites"]:
+                continue
+            rel_volume = abs(
+                meta["volume_per_atom"] - train_meta["volume_per_atom"]
+            ) / max(meta["volume_per_atom"], train_meta["volume_per_atom"], 1e-12)
+            if rel_volume > volume_tol:
+                continue
+            pair = (i, offset + j)
+            pairs.append(pair)
+            pair_prefilter_meta[pair] = rel_volume
 
+    matcher_kwargs = {
+        "ltol": float(ltol),
+        "stol": float(stol),
+        "angle_tol": float(angle_tol),
+        "primitive_cell": True,
+        "scale": False,
+        "attempt_supercell": False,
+        "allow_subset": False,
+    }
     print(
-        f"Training-set overlap: {len(candidate_structures)} candidates x "
-        f"{len(training_structures)} references; {len(pairs)} formula-compatible "
-        f"pairs; {min(ncpu, max(len(pairs), 1))} worker(s)"
+        f"Strict training-set overlap: {len(candidate_structures)} candidates x "
+        f"{len(training_structures)} training structures; {len(pairs)} strict-prefilter "
+        f"pairs; scale=False, attempt_supercell=False, ltol={ltol}, stol={stol}, "
+        f"angle_tol={angle_tol}, volume_tol={volume_tol}; "
+        f"{min(ncpu, max(len(pairs), 1))} worker(s)"
     )
 
     raw_results = []
@@ -816,357 +1500,619 @@ def compare_ranked_to_training_set(
         if worker_count == 1:
             _init_structure_match_worker(combined, matcher_kwargs)
             iterator = map(_match_structure_pair, pairs)
-            for result in tqdm(iterator, total=len(pairs), desc="Training overlap"):
+            for result in tqdm(iterator, total=len(pairs), desc="Strict training overlap"):
                 raw_results.append(result)
         else:
-            from multiprocessing import Pool
-            with Pool(
+            ctx = mp.get_context("spawn")
+            with ctx.Pool(
                 processes=worker_count,
                 initializer=_init_structure_match_worker,
                 initargs=(combined, matcher_kwargs),
             ) as pool:
                 iterator = pool.imap_unordered(
-                    _match_structure_pair, pairs, chunksize=max(1, chunksize)
+                    _match_structure_pair,
+                    pairs,
+                    chunksize=max(1, int(chunksize)),
                 )
-                for result in tqdm(iterator, total=len(pairs), desc="Training overlap"):
+                for result in tqdm(
+                    iterator,
+                    total=len(pairs),
+                    desc="Strict training overlap",
+                ):
                     raw_results.append(result)
 
     matches_by_candidate = defaultdict(list)
     match_rows = []
     for i, combined_j, matched, rms, max_dist, error in raw_results:
-        j = combined_j - offset
         if not matched:
             continue
-        candidate_row = valid_candidate_rows[i]
-        meta = training_meta[j]
+        j = combined_j - offset
+        cmeta = candidate_meta[i]
+        tmeta = training_meta[j]
+        rel_volume = pair_prefilter_meta[(i, combined_j)]
         record = {
-            "candidate_rank": int(candidate_row["rank"]),
-            "candidate_source_row": int(candidate_row["representative_source_row"]),
-            "candidate_gulp_db_row": int(candidate_row["gulp_db_row"]),
-            "training_db_row": meta["training_db_row"],
-            "training_label": meta["training_label"],
+            "candidate_rank": cmeta["rank"],
+            "candidate_source_row": cmeta["source_row"],
+            "training_db_row": tmeta["training_db_row"],
+            "training_label": tmeta["training_label"],
+            "candidate_space_group": cmeta["space_group"],
+            "training_space_group": tmeta["space_group"],
+            "candidate_primitive_sites": cmeta["primitive_sites"],
+            "training_primitive_sites": tmeta["primitive_sites"],
+            "candidate_volume_per_atom": cmeta["volume_per_atom"],
+            "training_volume_per_atom": tmeta["volume_per_atom"],
+            "relative_volume_per_atom_difference": rel_volume,
             "normalized_rms_distance": rms,
             "normalized_max_distance": max_dist,
             "error": error,
         }
         match_rows.append(record)
-        matches_by_candidate[int(candidate_row["rank"])].append(record)
+        matches_by_candidate[cmeta["source_row"]].append(record)
 
     annotated = ranked_df.copy()
     annotations = []
     for _, row in annotated.iterrows():
-        records = matches_by_candidate.get(int(row["rank"]), [])
-        records.sort(key=lambda rec: (
-            float("inf") if rec["normalized_rms_distance"] is None else rec["normalized_rms_distance"],
-            rec["training_db_row"],
-        ))
+        source_row = int(row["source_row"])
+        records = matches_by_candidate.get(source_row, [])
+        records.sort(
+            key=lambda rec: (
+                float("inf")
+                if rec["normalized_rms_distance"] is None
+                else rec["normalized_rms_distance"],
+                rec["relative_volume_per_atom_difference"],
+                rec["training_db_row"],
+            )
+        )
         best = records[0] if records else None
-        annotations.append({
-            "in_training_set": bool(records),
-            "training_match_count": len(records),
-            "training_db_rows_json": json.dumps(
-                [rec["training_db_row"] for rec in records], separators=(",", ":")
-            ),
-            "best_training_db_row": None if best is None else best["training_db_row"],
-            "best_training_label": None if best is None else best["training_label"],
-            "best_training_rms": None if best is None else best["normalized_rms_distance"],
-            "best_training_max_dist": None if best is None else best["normalized_max_distance"],
-        })
+        annotations.append(
+            {
+                "in_training_set": bool(records),
+                "training_match_count": len(records),
+                "training_db_rows_json": json.dumps(
+                    [rec["training_db_row"] for rec in records],
+                    separators=(",", ":"),
+                ),
+                "best_training_db_row": None if best is None else best["training_db_row"],
+                "best_training_label": None if best is None else best["training_label"],
+                "best_training_rms": None if best is None else best["normalized_rms_distance"],
+                "best_training_max_dist": None if best is None else best["normalized_max_distance"],
+                "best_training_relative_volume_difference": (
+                    None
+                    if best is None
+                    else best["relative_volume_per_atom_difference"]
+                ),
+            }
+        )
+
     annotation_df = pd.DataFrame(annotations)
-    annotated = pd.concat([annotated.reset_index(drop=True), annotation_df], axis=1)
-    match_df = pd.DataFrame(match_rows, columns=empty_columns)
+    annotated = pd.concat(
+        [annotated.reset_index(drop=True), annotation_df],
+        axis=1,
+    )
+    match_df = pd.DataFrame(match_rows, columns=output_columns)
     annotated.to_csv(output_dir / "ranked_candidates.csv", index=False)
     match_df.to_csv(output_dir / "training_set_matches.csv", index=False)
     return annotated, match_df
 
 
-def main() -> None:
-    args = parse_args()
-    start = time()
 
-    if args.ncpu < 1:
-        raise ValueError("--ncpu must be at least 1")
-    if args.begin < 0 or (args.end != -1 and args.end <= args.begin):
-        raise ValueError("invalid --begin/--end range")
+
+# -----------------------------------------------------------------------------
+# CLI / main
+# -----------------------------------------------------------------------------
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description=(
+            "Juliette TiO2 raw/SO3 audit v3.3 for floating-octahedra v33 output"
+        )
+    )
+    parser.add_argument(
+        "--generation-dir",
+        required=True,
+        help=(
+            "Completed v33 generation directory containing pre_joint_tio2 "
+            "and floating_builder_selected.csv"
+        ),
+    )
+    parser.add_argument(
+        "--cif-dir",
+        default=None,
+        help=(
+            "Override v33 ranked CIF directory; default: "
+            "<generation-dir>/pre_joint_tio2"
+        ),
+    )
+    parser.add_argument(
+        "--selected-metrics",
+        default=None,
+        help=(
+            "Override v33 selected metadata CSV; default: "
+            "<generation-dir>/floating_builder_selected.csv"
+        ),
+    )
+    parser.add_argument(
+        "--reference-tio2",
+        required=True,
+        help="Single TiO2 SO3 reference, normally rutile.cif",
+    )
+    parser.add_argument("--output-dir", default=None)
+    parser.add_argument("--begin", type=int, default=0)
+    parser.add_argument("--end", type=int, default=-1)
+    parser.add_argument("--ncpu", type=int, default=0)
+    parser.add_argument("--ti-o-cutoff", type=float, default=TIO_CUTOFF)
+    parser.add_argument("--rcut", type=float, default=2.4)
+    parser.add_argument("--nm-steps", type=int, default=50)
+    parser.add_argument("--lbfgs-steps", type=int, default=150)
+    parser.add_argument("--skip-so3-refinement", action="store_true")
+    parser.add_argument("--dedup-decimals", type=int, default=8)
+    parser.add_argument("--dedup-ltol", type=float, default=0.20)
+    parser.add_argument("--dedup-stol", type=float, default=0.30)
+    parser.add_argument("--dedup-angle-tol", type=float, default=5.0)
+    parser.add_argument("--dedup-volume-tol", type=float, default=0.20)
+    parser.add_argument(
+        "--standard-vasp-symprec",
+        type=float,
+        default=0.1,
+        help="Symmetry tolerance for unique standard-conventional VASP export",
+    )
+    parser.add_argument(
+        "--standard-vasp-angle-tolerance",
+        type=float,
+        default=5.0,
+        help="Angle tolerance in degrees for unique standard-conventional VASP export",
+    )
+    parser.add_argument("--match-chunksize", type=int, default=1)
+    parser.add_argument("--training-db", default=None)
+    parser.add_argument("--training-match-ltol", type=float, default=0.05)
+    parser.add_argument("--training-match-stol", type=float, default=0.08)
+    parser.add_argument("--training-match-angle-tol", type=float, default=1.0)
+    parser.add_argument("--training-match-volume-tol", type=float, default=0.08)
+    return parser.parse_args()
+
+
+def main():
+    started = time()
+    args = parse_args()
     if args.rcut <= 0:
         raise ValueError("--rcut must be positive")
-    if args.dedup_decimals < 3:
-        raise ValueError("--dedup-decimals must be at least 3")
-    if args.match_ltol <= 0 or args.match_stol <= 0 or args.match_angle_tol <= 0:
-        raise ValueError("StructureMatcher tolerances must be positive")
-    if args.match_chunksize < 1:
-        raise ValueError("--match-chunksize must be at least 1")
+    if args.nm_steps < 0 or args.lbfgs_steps < 0:
+        raise ValueError("optimizer step counts cannot be negative")
+    if not args.skip_so3_refinement and args.nm_steps + args.lbfgs_steps <= 0:
+        raise ValueError(
+            "at least one SO3 optimizer stage must have positive steps unless "
+            "--skip-so3-refinement is used"
+        )
+    if args.begin < 0:
+        raise ValueError("--begin cannot be negative")
+    if args.end != -1 and args.end <= args.begin:
+        raise ValueError("--end must be -1 or greater than --begin")
 
-    csv_path = Path(args.csv)
-    ref_path = Path(args.reference_sio2)
-    if not csv_path.is_file():
-        raise FileNotFoundError(csv_path)
-    if not ref_path.is_file():
-        raise FileNotFoundError(ref_path)
+    ncpu = resolve_ncpu(args.ncpu)
+    set_worker_thread_limits()
 
-    output_dir = Path(args.output_dir or csv_path.stem)
+    generation_dir = Path(args.generation_dir)
+    cif_dir = Path(args.cif_dir) if args.cif_dir is not None else None
+    selected_metrics = (
+        Path(args.selected_metrics) if args.selected_metrics is not None else None
+    )
+    reference_tio2 = Path(args.reference_tio2)
+    if not generation_dir.is_dir():
+        raise FileNotFoundError(generation_dir)
+    if not reference_tio2.is_file():
+        raise FileNotFoundError(reference_tio2)
+
+    training_db_path = (
+        Path(args.training_db) if args.training_db is not None else None
+    )
+    if training_db_path is not None and not training_db_path.is_file():
+        raise FileNotFoundError(training_db_path)
+
+    output_dir = Path(
+        args.output_dir or f"{generation_dir.name}-relax-v3.4"
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    print("--- SiO2 final relaxation ---")
-    print(f"Input CSV: {csv_path}")
+    print("--- Juliette TiO2 raw/SO3 audit v3.4 ---")
+    print(f"v33 generation directory: {generation_dir}")
+    print(f"Single SO3 reference: {reference_tio2}")
     print(f"Output directory: {output_dir}")
-    print(f"CPU workers: {args.ncpu}")
-    print(f"SO3 reference: {ref_path}")
-    print(f"SO3 cutoff: {args.rcut}")
-    print(f"Maximum SO3 energy passed to GULP: {args.max_so3_energy}")
-    print(f"SO3 stage-stop energy: {args.so3_stop_energy}")
-    print(f"Initial SO3 pre-screen: {args.max_initial_so3_energy}")
-    print(f"SO3 schedule: Nelder-Mead {args.nm_steps} + L-BFGS-B {args.lbfgs_steps}")
-    print(f"GULP force field: {args.ff_lib}")
     print(
-        "Post-GULP direct structure matching: "
-        f"ltol={args.match_ltol}, stol={args.match_stol}, "
-        f"angle_tol={args.match_angle_tol}, workers={args.ncpu}"
+        f"Resolved resources: ncpu={ncpu}; "
+        f"SLURM_CPUS_PER_TASK={os.environ.get('SLURM_CPUS_PER_TASK', 'unset')}; "
+        f"CPU_affinity={_cpu_affinity_count()}"
     )
-
-    df = pd.read_csv(csv_path)
-    if df.empty:
-        raise ValueError("input CSV is empty")
-    indices = discover_site_indices(df)
-    discrete, resolution, discrete_cell = infer_representation_mode(df)
-    stop = None if args.end == -1 else args.end
-    selected_df = df.iloc[args.begin:stop]
-    if selected_df.empty:
-        raise ValueError("selected row range is empty")
-
-    payloads = [
-        (int(idx), row.to_dict(), indices, discrete, resolution, discrete_cell)
-        for idx, row in selected_df.iterrows()
-    ]
-
-    from multiprocessing import Pool
-
-    decoded, decode_failures = [], []
-    if args.ncpu == 1:
-        iterator = map(decode_one, payloads)
-        for result in tqdm(iterator, total=len(payloads), desc="Strict decoding"):
-            if result[1] is None:
-                decode_failures.append({"source_row": result[0], "failure_reason": result[4]})
-            else:
-                decoded.append(result)
-    else:
-        with Pool(processes=args.ncpu) as pool:
-            iterator = pool.imap(decode_one, payloads, chunksize=1)
-            for result in tqdm(iterator, total=len(payloads), desc="Strict decoding"):
-                if result[1] is None:
-                    decode_failures.append({"source_row": result[0], "failure_reason": result[4]})
-                else:
-                    decoded.append(result)
-
-    decoded.sort(key=lambda item: item[0])
-    pd.DataFrame(decode_failures).to_csv(output_dir / "decode_failures.csv", index=False)
-    if not decoded:
-        raise RuntimeError("no rows survived strict decoding")
-
-    unique, duplicates = deduplicate(decoded, args.dedup_decimals)
     print(
-        f"Decoded {len(decoded)}/{len(payloads)}; unique before SO3: {len(unique)}; "
-        f"obvious duplicates removed: {len(duplicates)}"
+        "Input mode=v33 ranked CIFs; tabular decoder=REMOVED; GULP=REMOVED; "
+        f"SO3 refinement={'OFF' if args.skip_so3_refinement else 'ON'}"
     )
-    write_pre_so3_db(output_dir / "pre_so3.db", unique, str(csv_path))
 
-    provenance = []
-    for failure in decode_failures:
-        provenance.append({
-            "source_row": int(failure["source_row"]),
-            "representative_source_row": None,
-            "status": "decode_failed",
-            "failure_reason": failure["failure_reason"],
-        })
-    provenance.extend(duplicates)
-    for row_index, _xtal, _rep, _expected, source_rows, key in unique:
-        provenance.append({
-            "source_row": int(row_index),
-            "representative_source_row": int(row_index),
-            "status": "submitted_to_so3",
-            "generation_count": len(source_rows),
-            "source_rows_json": json.dumps(source_rows, separators=(",", ":")),
-            "dedup_key": key,
-        })
-
-    so3_prefix = output_dir / "so3"
-    so3_db_path = output_dir / "so3-0.db"
-    for suffix in ("-0.db", "-0.log"):
-        path = Path(str(so3_prefix) + suffix)
-        if path.exists():
-            path.unlink()
-
-    bu = builder(["Si", "O"], [1, 2], rank=0, prefix=str(so3_prefix))
-    bu.set_descriptor_calculator(mykwargs={"rcut": args.rcut})
-    bu.set_reference_enviroments(str(ref_path))
-
-    xtals = [item[1] for item in unique]
-    print(f"Direct SO3 optimization: {len(xtals)} unique structures")
-    so3_start = time()
-    stage_stop = args.so3_stop_energy
-    optimized = bu.optimize_xtals(
-        xtals,
-        ncpu=args.ncpu,
-        early_quit=stage_stop,
-        max_initial_similarity=args.max_initial_so3_energy,
-        minimizers=[
-            ("Nelder-Mead", args.nm_steps),
-            ("L-BFGS-B", args.lbfgs_steps),
-        ],
+    ingestion_start = time()
+    candidates, ingestion_failures, selected_metrics_path, resolved_cif_dir = (
+        load_v33_candidates(generation_dir, cif_dir, selected_metrics)
     )
-    so3_minutes = (time() - so3_start) / 60.0
-    print(f"SO3-valid structures: {len(optimized)}/{len(unique)} in {so3_minutes:.2f} min")
-
-    so3_results = pd.DataFrame(getattr(bu, "last_optimization_results", []))
-    if so3_results.empty and args.ncpu == 1:
-        # Serial builder versions may not expose detailed results; the DB remains authoritative.
-        so3_results = pd.DataFrame(columns=["task_id", "source_row", "similarity0", "similarity", "status", "error"])
-    so3_results.to_csv(output_dir / "so3_results.csv", index=False)
-    so3_failures = so3_results[so3_results.get("status", pd.Series(dtype=bool)) == False] if not so3_results.empty else so3_results
-    so3_failures.to_csv(output_dir / "so3_failures.csv", index=False)
-
-    gulp_db_path = output_dir / "gulp_candidates.db"
-    selected_count, so3_db_records = copy_selected_so3_rows(
-        so3_db_path,
-        gulp_db_path,
-        args.max_so3_energy,
+    pd.DataFrame(ingestion_failures).to_csv(
+        output_dir / "ingestion_failures.csv", index=False
     )
-    pd.DataFrame(so3_db_records).to_csv(output_dir / "so3_selection.csv", index=False)
-    print(f"SO3-energy selection passed {selected_count}/{len(so3_db_records)} structures to GULP")
+    if not candidates:
+        raise RuntimeError("No v33 ranked CIFs survived direct ingestion")
 
-    gulp_minutes = 0.0
-    if selected_count and not args.skip_gulp:
-        gulp_start = time()
-        gulp_db = database_topology(
-            str(gulp_db_path),
-            log_file=str(output_dir / "gulp.log"),
-        )
-        gulp_db.update_row_energy(
-            "GULP",
-            ncpu=args.ncpu,
-            ff_lib=args.ff_lib,
-            overwrite=False,
-            calc_folder=str(output_dir / "gulp_calc"),
-        )
-        gulp_minutes = (time() - gulp_start) / 60.0
-        matcher_kwargs = {
-            "ltol": args.match_ltol,
-            "stol": args.match_stol,
-            "angle_tol": args.match_angle_tol,
+    ingestion_rows = [
+        {
+            "source_row": item["source_row"],
+            "final_rank": item["final_rank"],
+            "candidate_id": item["candidate_id"],
+            "cif_path": str(item["cif_path"]),
+            "generated_spg": item["generated_spg"],
+            "detected_spg": item["detected_spg"],
+            "spg_agrees": item["spg_agrees"],
         }
-        ranked_df, ranked_all_df, post_gulp_duplicates_df, structure_match_pairs_df, gulp_failed_df = write_ranked_outputs(
-            gulp_db_path,
+        for item in candidates
+    ]
+    pd.DataFrame(ingestion_rows).to_csv(
+        output_dir / "v33_cif_ingestion.csv", index=False
+    )
+
+    unique, duplicates = deduplicate_raw_candidates(
+        candidates, args.dedup_decimals
+    )
+    pd.DataFrame(duplicates).to_csv(
+        output_dir / "pre_so3_duplicates.csv", index=False
+    )
+    selected = unique[args.begin:] if args.end == -1 else unique[args.begin:args.end]
+    if not selected:
+        raise ValueError("selected unique candidate range is empty")
+    ingestion_seconds = time() - ingestion_start
+
+    print(f"Resolved v33 CIF directory: {resolved_cif_dir}")
+    print(f"Resolved v33 metadata: {selected_metrics_path}")
+    print(
+        f"Ingested {len(candidates)} CIFs; exact unique={len(unique)}; "
+        f"selected={len(selected)}; ingestion_failures={len(ingestion_failures)}"
+    )
+
+    raw_candidates = []
+    raw_atoms_by_source = {}
+    meta_by_source = {}
+    candidate_summary = {}
+    stage_rows = []
+    movement_rows = []
+
+    raw_cif_dir = output_dir / "raw_cifs"
+    so3_cif_dir = output_dir / "so3_cifs"
+    for directory in (raw_cif_dir, so3_cif_dir):
+        if directory.exists():
+            shutil.rmtree(directory)
+        directory.mkdir(parents=True)
+
+    for item in selected:
+        source_row = int(item["source_row"])
+        xtal = item["xtal"]
+        raw_atoms = item["atoms"]
+        meta = item["meta"]
+        raw_candidates.append((source_row, xtal))
+        raw_atoms_by_source[source_row] = raw_atoms
+        meta_by_source[source_row] = meta
+        raw_cif_path = raw_cif_dir / (
+            f"rank_{int(item['final_rank']):04d}_row_{source_row:04d}_raw.cif"
+        )
+        ase_write(str(raw_cif_path), raw_atoms, format="cif")
+        candidate_summary[source_row] = {
+            "source_row": source_row,
+            "candidate_id": item["candidate_id"],
+            "final_rank": item["final_rank"],
+            "chemistry_score": _metadata_value(meta, "chemistry_score"),
+            "total_loss": _metadata_value(meta, "total_loss"),
+            "ti_fingerprint_q90": _metadata_value(meta, "ti_fingerprint_q90"),
+            "generated_spg": item["generated_spg"],
+            "raw_detected_spg": item["detected_spg"],
+            "raw_spg_agrees_with_generation": item["spg_agrees"],
+            "so3_success": None,
+            "so3_refinement_applied": False,
+            "failure_stage": None,
+            "generation_count": item["generation_count"],
+            "source_rows_json": json.dumps(
+                item["source_rows"], separators=(",", ":")
+            ),
+            "dedup_key": item["dedup_key"],
+            "v33_input_cif_path": str(item["cif_path"]),
+            "raw_cif_path": str(raw_cif_path),
+        }
+        stage_rows.append(
+            stage_metric_record(
+                source_row, meta, "raw", raw_atoms, args.ti_o_cutoff
+            )
+        )
+
+    diagnostic_rows = []
+    diagnostic_start = time()
+    raw_values, raw_diag = evaluate_reference_so3_stage(
+        raw_candidates, reference_tio2, args.rcut, "raw", ncpu
+    )
+    diagnostic_rows.extend(raw_diag)
+    for source_row, value in raw_values.items():
+        candidate_summary[source_row]["so3_raw_energy"] = value
+
+    projection_start = time()
+    if args.skip_so3_refinement:
+        projected_xtals = [
+            (int(source_row), xtal) for source_row, xtal in raw_candidates
+        ]
+        projection_rows = []
+        for source_row, _ in projected_xtals:
+            raw_value = candidate_summary[source_row].get(
+                "so3_raw_energy", math.nan
+            )
+            projection_rows.append(
+                {
+                    "source_row": source_row,
+                    "success": True,
+                    "initial_so3_reference_energy": raw_value,
+                    "final_so3_reference_energy": raw_value,
+                    "improved": False,
+                    "raw_fallback_used": True,
+                    "lattice_dof": math.nan,
+                    "site_coordinate_dof": math.nan,
+                    "objective_evaluations": 0,
+                    "refinement_skipped": True,
+                    "error": None,
+                }
+            )
+    else:
+        projected_xtals, projection_rows = optimize_single_reference_so3(
+            raw_candidates,
+            reference_tio2,
+            args.rcut,
+            ncpu,
+            args.nm_steps,
+            args.lbfgs_steps,
+        )
+        for row in projection_rows:
+            row["refinement_skipped"] = False
+    projection_seconds = time() - projection_start
+    pd.DataFrame(projection_rows).to_csv(
+        output_dir / "so3_projection_results.csv", index=False
+    )
+
+    projection_by_source = {
+        int(row["source_row"]): row for row in projection_rows
+    }
+    for source_row, xtal in projected_xtals:
+        source_row = int(source_row)
+        row = projection_by_source[source_row]
+        summary = candidate_summary[source_row]
+        summary["so3_success"] = bool(row["success"])
+        summary["so3_initial_energy"] = row["initial_so3_reference_energy"]
+        summary["so3_final_energy"] = row["final_so3_reference_energy"]
+        summary["so3_improved"] = bool(row["improved"])
+        summary["so3_raw_fallback_used"] = bool(row["raw_fallback_used"])
+        summary["so3_refinement_applied"] = bool(
+            not args.skip_so3_refinement and row["success"] and row["improved"]
+        )
+        if not row["success"]:
+            summary["failure_stage"] = "so3"
+            summary["so3_error"] = row["error"]
+
+        final_atoms = xtal.to_ase(resort=False)
+        so3_cif_path = so3_cif_dir / (
+            f"rank_{int(summary['final_rank']):04d}_row_{source_row:04d}_"
+            f"{'so3' if summary['so3_refinement_applied'] else 'raw_fallback'}.cif"
+        )
+        ase_write(str(so3_cif_path), final_atoms, format="cif")
+        summary["so3_cif_path"] = str(so3_cif_path)
+        stage_rows.append(
+            stage_metric_record(
+                source_row,
+                meta_by_source[source_row],
+                "so3" if not args.skip_so3_refinement else "raw_final",
+                final_atoms,
+                args.ti_o_cutoff,
+            )
+        )
+        try:
+            movement = same_order_movement_metrics(
+                raw_atoms_by_source[source_row], final_atoms
+            )
+            movement_rows.append(
+                {
+                    "source_row": source_row,
+                    "from_stage": "raw",
+                    "to_stage": (
+                        "so3" if not args.skip_so3_refinement else "raw_final"
+                    ),
+                    **movement,
+                    "error": None,
+                }
+            )
+            for key, value in movement.items():
+                summary[f"raw_to_so3_{key}"] = value
+        except Exception as exc:
+            movement_rows.append(
+                {
+                    "source_row": source_row,
+                    "from_stage": "raw",
+                    "to_stage": (
+                        "so3" if not args.skip_so3_refinement else "raw_final"
+                    ),
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+
+    projected_values, projected_diag = evaluate_reference_so3_stage(
+        projected_xtals,
+        reference_tio2,
+        args.rcut,
+        "so3" if not args.skip_so3_refinement else "raw_final",
+        ncpu,
+    )
+    diagnostic_rows.extend(projected_diag)
+    for source_row, value in projected_values.items():
+        summary = candidate_summary[source_row]
+        summary["so3_projected_energy"] = value
+        raw_value = summary.get("so3_raw_energy", math.nan)
+        summary["delta_so3_projected_minus_raw"] = (
+            value - raw_value
+            if math.isfinite(value) and math.isfinite(raw_value)
+            else math.nan
+        )
+    diagnostic_seconds = time() - diagnostic_start
+
+    final_candidates = [
+        (int(source_row), xtal) for source_row, xtal in projected_xtals
+    ]
+    dedup_start = time()
+    ranked_df, _, _ = deduplicate_final_stage(
+        final_candidates,
+        candidate_summary,
+        output_dir,
+        ncpu,
+        args.dedup_ltol,
+        args.dedup_stol,
+        args.dedup_angle_tol,
+        args.dedup_volume_tol,
+        args.match_chunksize,
+    )
+    dedup_seconds = time() - dedup_start
+
+    standard_vasp_report, unique_standard_vasp_dir = export_unique_standard_vasp(
+        ranked_df,
+        final_candidates,
+        output_dir,
+        symprec=args.standard_vasp_symprec,
+        angle_tolerance=args.standard_vasp_angle_tolerance,
+    )
+
+    training_seconds = 0.0
+    if training_db_path is not None:
+        training_start = time()
+        ranked_df, _ = compare_ranked_to_training_set_strict(
+            ranked_df,
+            training_db_path,
             output_dir,
-            args.ncpu,
-            matcher_kwargs,
-            args.match_energy_window,
-            args.match_volume_tol,
+            ncpu,
+            args.training_match_ltol,
+            args.training_match_stol,
+            args.training_match_angle_tol,
+            args.training_match_volume_tol,
             args.match_chunksize,
         )
-        print(
-            f"GULP-successful candidates: {len(ranked_all_df)}/{selected_count}; "
-            f"apparent duplicates removed: {len(post_gulp_duplicates_df)}; "
-            f"ranked unique candidates: {len(ranked_df)}"
-        )
-        training_matches_df = pd.DataFrame()
-        if args.skip_training_overlap:
-            print("Skipping training-set overlap check.")
-        elif args.training_db is None:
-            print("Training-set overlap not requested; use --training-db PATH.")
-        else:
-            training_db_path = Path(args.training_db)
-            if not training_db_path.is_file():
-                raise FileNotFoundError(training_db_path)
-            ranked_df, training_matches_df = compare_ranked_to_training_set(
-                ranked_df,
-                training_db_path,
-                output_dir,
-                args.ncpu,
-                matcher_kwargs,
-                args.match_chunksize,
-            )
-            print(
-                f"Training-set overlap: {int(ranked_df['in_training_set'].sum())}/"
-                f"{len(ranked_df)} unique candidates matched known structures"
-            )
-    else:
-        ranked_df = pd.DataFrame()
-        ranked_all_df = pd.DataFrame()
-        post_gulp_duplicates_df = pd.DataFrame()
-        structure_match_pairs_df = pd.DataFrame()
-        gulp_failed_df = pd.DataFrame()
-        training_matches_df = pd.DataFrame()
-        ranked_df.to_csv(output_dir / "ranked_candidates.csv", index=False)
-        ranked_all_df.to_csv(output_dir / "ranked_all_candidates.csv", index=False)
-        post_gulp_duplicates_df.to_csv(output_dir / "post_gulp_duplicates.csv", index=False)
-        structure_match_pairs_df.to_csv(output_dir / "structure_match_pairs.csv", index=False)
-        gulp_failed_df.to_csv(output_dir / "gulp_failures.csv", index=False)
-        training_matches_df.to_csv(output_dir / "training_set_matches.csv", index=False)
-        if args.skip_gulp:
-            print("GULP skipped by request.")
+        training_seconds = time() - training_start
 
-    pd.DataFrame(provenance).sort_values("source_row").to_csv(
-        output_dir / "provenance.csv", index=False
+    pd.DataFrame(diagnostic_rows).to_csv(
+        output_dir / "so3_stage_diagnostics.csv", index=False
     )
+    pd.DataFrame(stage_rows).to_csv(
+        output_dir / "relaxation_stage_metrics.csv", index=False
+    )
+    pd.DataFrame(movement_rows).to_csv(
+        output_dir / "stage_movement_metrics.csv", index=False
+    )
+    pd.DataFrame(
+        [candidate_summary[key] for key in sorted(candidate_summary)]
+    ).to_csv(output_dir / "relaxation_candidate_summary.csv", index=False)
 
-    total_minutes = (time() - start) / 60.0
-    summary = {
-        "source_csv": str(csv_path),
-        "input_rows": len(payloads),
-        "decoded": len(decoded),
-        "decode_failed": len(decode_failures),
-        "unique_before_so3": len(unique),
-        "duplicates_before_so3": len(duplicates),
-        "so3_valid": len(optimized),
-        "max_so3_energy": args.max_so3_energy,
-        "so3_stop_energy": args.so3_stop_energy,
-        "max_initial_so3_energy": args.max_initial_so3_energy,
-        "so3_minimizers": [["Nelder-Mead", args.nm_steps], ["L-BFGS-B", args.lbfgs_steps]],
-        "passed_to_gulp": selected_count,
-        "gulp_successful": len(ranked_all_df),
-        "post_gulp_duplicates": len(post_gulp_duplicates_df),
-        "ranked_unique_candidates": len(ranked_df),
-        "training_db": args.training_db,
-        "training_overlap_matches": len(training_matches_df),
-        "candidates_in_training_set": (
-            int(ranked_df["in_training_set"].sum())
-            if not ranked_df.empty and "in_training_set" in ranked_df.columns else 0
-        ),
-        "gulp_failed": len(gulp_failed_df),
-        "so3_minutes": so3_minutes,
-        "gulp_minutes": gulp_minutes,
-        "total_minutes": total_minutes,
-        "so3_rcut": args.rcut,
-        "ff_lib": args.ff_lib,
-        "coordination_filtering": False,
-        "topology_filtering": False,
-        "structure_matcher_deduplication": True,
-        "structure_matcher_parallel_workers": args.ncpu,
-        "training_overlap_structure_matcher": True,
-        "structure_matcher": {
-            "ltol": args.match_ltol,
-            "stol": args.match_stol,
-            "angle_tol": args.match_angle_tol,
-            "primitive_cell": True,
-            "scale": True,
-            "attempt_supercell": True,
-            "comparator": "ElementComparator",
+    pipeline_summary = {
+        "version": "3.4",
+        "input": {
+            "mode": "v33_ranked_cif_direct",
+            "generation_dir": str(generation_dir),
+            "cif_dir": str(resolved_cif_dir),
+            "selected_metadata": str(selected_metrics_path),
+            "tabular_decoder": False,
+            "cif_authoritative": True,
         },
-        "structure_match_pair_prefilters": {
-            "energy_window_eV_per_atom": args.match_energy_window,
-            "relative_volume_per_atom_tolerance": args.match_volume_tol,
-            "same_reduced_formula": True,
+        "pipeline": [
+            "v33_ranked_cif_ingestion",
+            "exact_pyxtal_representation_deduplication",
+            "raw_single_reference_so3_diagnostic",
+            (
+                "site_only_single_reference_so3_refinement"
+                if not args.skip_so3_refinement
+                else "so3_refinement_skipped"
+            ),
+            "raw_so3_movement_and_chemistry_comparison",
+            "raw_and_so3_cif_export",
+            "final_stage_structurematcher_deduplication",
+            "unique_symmetrized_standard_conventional_vasp_export",
+            (
+                "strict_training_overlap"
+                if training_db_path is not None
+                else "training_overlap_skipped"
+            ),
+        ],
+        "removed_paths": [
+            "tabular_wp_xyz_decoder",
+            "GULP_relaxation",
+            "ReaxFF_Ti_O_potential",
+            "SO3_similarity_ranking",
+        ],
+        "so3_objective": {
+            "descriptor": "SO3",
+            "target": "single rutile TiO2 reference",
+            "optimizer": (
+                "full-representation SciPy minimization of lego.util.calculate_S"
+                if not args.skip_so3_refinement
+                else "diagnostic only"
+            ),
+            "raw_fallback": True,
+            "rcut": float(args.rcut),
+            "lattice_mode": "optimized_with_native_lego_bounds",
+            "reference_routing": (
+                "site-labeled by species: Ti->rutile Ti, O->rutile O"
+            ),
+            "used_for_final_ranking": False,
+            "nm_steps": int(args.nm_steps),
+            "lbfgs_steps": int(args.lbfgs_steps),
+        },
+        "final_deduplication": {
+            "representative_policy": (
+                "earliest v33 final_rank, then source_row; no energy/SO3 ranking"
+            ),
+            "ltol": float(args.dedup_ltol),
+            "stol": float(args.dedup_stol),
+            "angle_tol": float(args.dedup_angle_tol),
+            "volume_tol": float(args.dedup_volume_tol),
+        },
+        "resources": {"ncpu": int(ncpu)},
+        "counts": {
+            "v33_cifs_found": int(len(candidates) + len(ingestion_failures)),
+            "ingested": int(len(candidates)),
+            "ingestion_failures": int(len(ingestion_failures)),
+            "exact_unique": int(len(unique)),
+            "selected": int(len(selected)),
+            "projection_success": int(
+                sum(bool(r["success"]) for r in projection_rows)
+            ),
+            "ranked_unique": int(len(ranked_df)),
+            "unique_standard_vasp_written": int((standard_vasp_report.get("status") == "ok").sum()) if not standard_vasp_report.empty else 0,
+        },
+        "timing_seconds": {
+            "ingestion_and_pre_so3_dedup": float(ingestion_seconds),
+            "so3_projection": float(projection_seconds),
+            "so3_diagnostics": float(diagnostic_seconds),
+            "final_stage_dedup": float(dedup_seconds),
+            "training_overlap": float(training_seconds),
+            "total": float(time() - started),
         },
     }
-    (output_dir / "pipeline_summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
+    with open(
+        output_dir / "pipeline_summary.json", "w", encoding="utf-8"
+    ) as handle:
+        json.dump(pipeline_summary, handle, indent=2)
 
+    print(f"Candidate summary: {output_dir / 'relaxation_candidate_summary.csv'}")
+    print(f"Stage metrics: {output_dir / 'relaxation_stage_metrics.csv'}")
+    print(f"Movement metrics: {output_dir / 'stage_movement_metrics.csv'}")
+    print(f"Raw CIFs: {raw_cif_dir}")
+    print(f"SO3/fallback CIFs: {so3_cif_dir}")
+    print(f"SO3 diagnostics: {output_dir / 'so3_stage_diagnostics.csv'}")
     print(f"Ranked candidates: {output_dir / 'ranked_candidates.csv'}")
-    if args.training_db is not None and not args.skip_training_overlap:
-        print(f"Training-set matches: {output_dir / 'training_set_matches.csv'}")
-    print(f"Candidate CIFs: {output_dir / 'candidates'}")
-    print(f"Total wall time: {total_minutes:.2f} min")
+    print(f"Unique standard VASP: {unique_standard_vasp_dir}")
+    print(f"Unique standard VASP report: {output_dir / 'unique_standard_vasp_report.csv'}")
+    if training_db_path is not None:
+        print(f"Training matches: {output_dir / 'training_set_matches.csv'}")
+    print(f"Total wall time: {(time() - started) / 60.0:.2f} min")
 
 
 if __name__ == "__main__":
     main()
-

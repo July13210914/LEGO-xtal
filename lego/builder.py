@@ -518,7 +518,7 @@ def minimize_from_x(
         except:
             return None
 
-    x0 = np.array(x.copy())
+    initial_x = np.asarray(x, dtype=float).copy()
     # Extract variables, call from Pyxtal
     [N_abc, N_ang] = Lattice.get_dofs(xtal.lattice.ltype)
     rep = xtal.get_1D_representation()
@@ -559,8 +559,8 @@ def minimize_from_x(
                 f0.write(strs)
             # Initial value
             strs = 'Init: {:9.3f} '.format(sim0)
-            for x0 in x:
-                strs += '{:8.4f} '.format(x0)
+            for value in x:
+                strs += '{:8.4f} '.format(value)
             strs += '\n'
             print(strs)
             f0.write(strs)
@@ -574,48 +574,66 @@ def minimize_from_x(
             if filename is not None:
                 with open(filename, 'a+') as f0:
                     strs = 'Iter: {:9.3f} '.format(f)
-                    for x0 in x[:3]:
-                        strs += '{:8.4f} '.format(x0)
+                    for value in x[:3]:
+                        strs += '{:8.4f} '.format(value)
                     strs += '\n'
                     f0.write(strs)
         callback = print_local_fun if filename is not None else None
 
+        # Keep the best reconstructable representation seen so far.  The old
+        # implementation left ``res`` undefined when sim0 <= early_quit, so
+        # every already-good structure was silently dropped at reconstruction.
+        # It also replaced x with a worse optimizer result.  SO3 must be a safe
+        # preconditioner: stopping, stalling, or optimizer failure falls back to
+        # the best representation, including the untouched input geometry.
+        best_x = np.asarray(x, dtype=float).copy()
+        best_value = float(sim0)
         previous_stage_value = float(sim0)
+
         for minimizer in minimizers:
-            # Do not spend another optimizer stage once the structure already
-            # satisfies the production SO3 handoff threshold.
-            if previous_stage_value <= early_quit:
+            if best_value <= early_quit:
                 break
 
-            (method, step) = minimizer
-            if len(x) != len(bounds):
-                print('debug min', xtal, x, bounds, len(x), len(bounds))
-            res = minimize(
-                calculate_S,
-                x,
-                method=method,
-                args=(xtal, ref_envs, calculator),
-                jac=None if method == 'Nelder-Mead' else jac,
-                bounds=bounds,
-                options={'maxiter': step},
-                callback=callback,
-            )
-            x = res.x
-            if xtal.lattice is None:
-                return None
+            method, step = minimizer
+            if len(best_x) != len(bounds):
+                print('debug min', xtal, best_x, bounds, len(best_x), len(bounds))
 
-            stage_value = float(calculate_S(x, xtal, ref_envs, calculator))
-            # Stop when the requested SO3 quality has been reached.
-            if stage_value <= early_quit:
-                previous_stage_value = stage_value
+            try:
+                stage_result = minimize(
+                    calculate_S,
+                    best_x,
+                    method=method,
+                    args=(xtal, ref_envs, calculator),
+                    jac=None if method == 'Nelder-Mead' else jac,
+                    bounds=bounds,
+                    options={'maxiter': step},
+                    callback=callback,
+                )
+                candidate_x = np.asarray(stage_result.x, dtype=float)
+                stage_value = float(calculate_S(candidate_x, xtal, ref_envs, calculator))
+            except Exception:
+                # Preserve the best earlier geometry rather than discarding the
+                # complete structure because one numerical optimizer failed.
                 break
-            # Stop a stalled sequence rather than launching another expensive
-            # numerical-gradient stage with negligible benefit.
+
+            if not np.isfinite(stage_value):
+                break
+
             improvement = previous_stage_value - stage_value
+            if stage_value < best_value:
+                best_x = candidate_x.copy()
+                best_value = stage_value
+
+            if best_value <= early_quit:
+                break
+
+            # Do not launch another expensive stage after negligible or negative
+            # progress, but retain the best geometry found so far.
             if improvement <= max(1.0e-8, 1.0e-5 * abs(previous_stage_value)):
-                previous_stage_value = stage_value
                 break
             previous_stage_value = stage_value
+
+        x = best_x
 
         if filename is not None:
             with open(filename, 'a+') as f0:
@@ -671,7 +689,7 @@ def minimize_from_x(
 
     try:
         xtal.from_1d_rep(
-            res.x,
+            x,
             sites,
             dim=dim,
         )
@@ -681,7 +699,7 @@ def minimize_from_x(
             target_coordination,
         )
     
-        return xtal, (x0, res.x)
+        return xtal, (initial_x, np.asarray(x, dtype=float).copy())
     
     except Exception:
         return None
